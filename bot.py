@@ -165,7 +165,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif WDONE_PREFIX.match(text):
         await update.message.reply_text(
             "Usage: <code>!wdone &lt;N or task_id&gt;</code>\n"
-            "Examples: <code>!wdone 1</code> or <code>!wdone repo/merge_requests/123</code>",
+            "Examples: <code>!wdone 1</code>, <code>!wdone #1</code>, or <code>!wdone repo/merge_requests/123</code>",
             parse_mode=ParseMode.HTML
         )
         return
@@ -225,9 +225,12 @@ async def handle_w(update: Update, chat_id: int) -> None:
 
 async def handle_wdone(update: Update, chat_id: int, task_ref: str) -> None:
     """Handle !wdone command - remove a task by sequence number or task_id."""
+    # Strip # prefix if present
+    task_ref_clean = task_ref.lstrip('#')
+    
     # Try to parse as sequence number first
-    if task_ref.isdigit():
-        removed_task = db.remove_task_by_seq(chat_id, int(task_ref))
+    if task_ref_clean.isdigit():
+        removed_task = db.remove_task_by_seq(chat_id, int(task_ref_clean))
     else:
         removed_task = db.remove_task_by_id(chat_id, task_ref)
     
@@ -253,9 +256,9 @@ Examples:
 <code>!w</code>
 List all tasks in the queue
 
-<code>!wdone &lt;#N or task_id&gt;</code>
+<code>!wdone &lt;N or task_id&gt;</code>
 Remove a completed task by number or ID
-Examples: <code>!wdone 1</code> or <code>!wdone repo/merge_requests/123</code>
+Examples: <code>!wdone 1</code>, <code>!wdone #1</code>, or <code>!wdone repo/merge_requests/123</code>
 
 <code>!whelp</code>
 Show this help message

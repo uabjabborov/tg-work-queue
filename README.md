@@ -78,6 +78,8 @@ python bot.py
 
 # Mark task as done (by number or task ID)
 !wdone 1
+# Or with # prefix:
+!wdone #1
 
 # Response:
 # Removed [#1] monorepo/merge_requests/120 (added by @bob)
