@@ -24,8 +24,10 @@ db = Database()
 
 # Regex patterns for commands
 WADD_PATTERN = re.compile(r"^!wadd\s+(https?://\S+)\s+@(\w+)$", re.IGNORECASE)
+WADD_PREFIX = re.compile(r"^!wadd\b", re.IGNORECASE)
 W_PATTERN = re.compile(r"^!w$", re.IGNORECASE)
 WDONE_PATTERN = re.compile(r"^!wdone\s+(.+)$", re.IGNORECASE)
+WDONE_PREFIX = re.compile(r"^!wdone\b", re.IGNORECASE)
 WHELP_PATTERN = re.compile(r"^!whelp$", re.IGNORECASE)
 
 # Patterns for extracting task ID from MR/PR URLs
@@ -33,6 +35,55 @@ WHELP_PATTERN = re.compile(r"^!whelp$", re.IGNORECASE)
 GITLAB_MR_PATTERN = re.compile(r"https?://[^/]+/(?:.+?/)*([^/]+)/-/merge_requests/(\d+)")
 # GitHub: https://github.com/owner/repo/pull/123
 GITHUB_PR_PATTERN = re.compile(r"https?://github\.com/[^/]+/([^/]+)/pull/(\d+)")
+
+
+def validate_wadd_args(text: str) -> str:
+    """Validate !wadd arguments and return specific error message."""
+    parts = text.split(None, 2)  # Split into max 3 parts: !wadd, url, @user
+    
+    if len(parts) == 1:
+        # Just "!wadd" with no arguments
+        return (
+            "Missing URL and username.\n"
+            "Usage: <code>!wadd &lt;URL&gt; @username</code>\n"
+            "Example: <code>!wadd http://gitlab.example.com/group/repo/-/merge_requests/123 @alice</code>"
+        )
+    
+    if len(parts) == 2:
+        arg = parts[1]
+        if arg.startswith("@"):
+            return "Missing URL. Provide a GitLab MR or GitHub PR link before the username."
+        elif arg.startswith("http://") or arg.startswith("https://"):
+            return "Missing username. Add <code>@username</code> after the URL."
+        else:
+            return (
+                "Invalid URL. Must start with http:// or https://\n"
+                "Example: <code>!wadd http://gitlab.example.com/group/repo/-/merge_requests/123 @alice</code>"
+            )
+    
+    # len(parts) >= 3, but pattern didn't match
+    url_part = parts[1]
+    user_part = parts[2].split()[0] if parts[2] else ""
+    
+    if not (url_part.startswith("http://") or url_part.startswith("https://")):
+        return "Invalid URL. Must start with http:// or https://"
+    
+    if not user_part.startswith("@"):
+        return f"Invalid username format. Use <code>@username</code> (got: {html_escape(user_part)})"
+    
+    # URL looks valid but doesn't match GitLab/GitHub pattern
+    if not GITLAB_MR_PATTERN.match(url_part) and not GITHUB_PR_PATTERN.match(url_part):
+        return (
+            "Unsupported URL format. Must be a GitLab merge request or GitHub pull request.\n"
+            "Supported formats:\n"
+            "• <code>http://host/group/project/-/merge_requests/N</code>\n"
+            "• <code>https://github.com/owner/repo/pull/N</code>"
+        )
+    
+    return (
+        "Invalid command format.\n"
+        "Usage: <code>!wadd &lt;URL&gt; @username</code>"
+    )
 
 
 def extract_task_id(url: str) -> str | None:
@@ -76,6 +127,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         assigned_to = wadd_match.group(2)
         await handle_wadd(update, chat_id, url, assigned_to, created_by)
         return
+    elif WADD_PREFIX.match(text):
+        error_msg = validate_wadd_args(text)
+        await update.message.reply_text(error_msg, parse_mode=ParseMode.HTML)
+        return
     
     # Check for !w command
     if W_PATTERN.match(text):
@@ -87,6 +142,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if wdone_match:
         task_id = wdone_match.group(1).strip()
         await handle_wdone(update, chat_id, task_id)
+        return
+    elif WDONE_PREFIX.match(text):
+        await update.message.reply_text(
+            "Usage: <code>!wdone &lt;N or task_id&gt;</code>\n"
+            "Examples: <code>!wdone 1</code> or <code>!wdone repo/merge_requests/123</code>",
+            parse_mode=ParseMode.HTML
+        )
         return
     
     # Check for !whelp command
