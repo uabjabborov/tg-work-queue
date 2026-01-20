@@ -1,7 +1,12 @@
+import os
 import sqlite3
 from typing import Optional
 from dataclasses import dataclass
 from datetime import datetime
+
+# Use /app/data in Docker, current directory otherwise
+DATA_DIR = os.environ.get("DATA_DIR", ".")
+DB_PATH = os.path.join(DATA_DIR, "workqueue.db")
 
 
 @dataclass
@@ -17,8 +22,10 @@ class Task:
 
 
 class Database:
-    def __init__(self, db_path: str = "workqueue.db"):
+    def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
+        # Ensure data directory exists
+        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
