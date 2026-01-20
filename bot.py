@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
 from telegram.constants import ParseMode
+from html import escape as html_escape
 
 from database import Database
 
@@ -108,14 +109,14 @@ async def handle_wadd(update: Update, chat_id: int, url: str, assigned_to: str, 
         return
     
     assigned_to_formatted = f"@{assigned_to}"
-    added = db.add_task(chat_id, task_id, url, assigned_to_formatted, created_by)
+    seq_num = db.add_task(chat_id, task_id, url, assigned_to_formatted, created_by)
     
-    if not added:
+    if seq_num is None:
         await update.message.reply_text(f"Task {task_id} already exists in the queue.")
         return
     
-    response = f"[{task_id}]({url}) → {assigned_to_formatted}"
-    await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+    response = f'[#{seq_num}] <a href="{html_escape(url)}">{html_escape(task_id)}</a> → {html_escape(assigned_to_formatted)}'
+    await update.message.reply_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     logger.info(f"Added task {task_id} in chat {chat_id}: {url} -> {assigned_to_formatted}")
 
 
@@ -129,48 +130,52 @@ async def handle_w(update: Update, chat_id: int) -> None:
     
     lines = []
     for t in tasks:
-        lines.append(f"[{t.task_id}]({t.url}) → {t.assigned_to} (by {t.created_by})")
+        lines.append(f'[#{t.seq_num}] <a href="{html_escape(t.url)}">{html_escape(t.task_id)}</a> → {html_escape(t.assigned_to)} (by {html_escape(t.created_by)})')
     
     response = "\n".join(lines)
-    await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+    await update.message.reply_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
-async def handle_wdone(update: Update, chat_id: int, task_id: str) -> None:
-    """Handle !wdone command - remove a task."""
-    removed_task = db.remove_task(chat_id, task_id)
+async def handle_wdone(update: Update, chat_id: int, task_ref: str) -> None:
+    """Handle !wdone command - remove a task by sequence number or task_id."""
+    # Try to parse as sequence number first
+    if task_ref.isdigit():
+        removed_task = db.remove_task_by_seq(chat_id, int(task_ref))
+    else:
+        removed_task = db.remove_task_by_id(chat_id, task_ref)
     
     if removed_task is None:
-        await update.message.reply_text(f"Task {task_id} not found.")
+        await update.message.reply_text(f"Task {task_ref} not found.")
         return
     
-    response = f"Removed [{task_id}]({removed_task.url}) (added by {removed_task.created_by})"
-    await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-    logger.info(f"Removed task {task_id} from chat {chat_id}")
+    response = f'Removed [#{removed_task.seq_num}] <a href="{html_escape(removed_task.url)}">{html_escape(removed_task.task_id)}</a> (added by {html_escape(removed_task.created_by)})'
+    await update.message.reply_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    logger.info(f"Removed task #{removed_task.seq_num} ({removed_task.task_id}) from chat {chat_id}")
 
 
 async def handle_whelp(update: Update) -> None:
     """Handle !whelp command - display help instructions."""
-    help_text = """*Work Queue Commands*
+    help_text = """<b>Work Queue Commands</b>
 
-`!wadd <URL> @username`
+<code>!wadd &lt;URL&gt; @username</code>
 Add a merge request and assign to user
-Example: `!wadd http://gitlab.example.com/group/repo/-/merge_requests/123 @alice`
+Example: <code>!wadd http://gitlab.example.com/group/repo/-/merge_requests/123 @alice</code>
 
-`!w`
+<code>!w</code>
 List all tasks in the queue
 
-`!wdone <task_id>`
-Remove a completed task
-Example: `!wdone repo/merge_requests/123`
+<code>!wdone &lt;#N or task_id&gt;</code>
+Remove a completed task by number or ID
+Examples: <code>!wdone 1</code> or <code>!wdone repo/merge_requests/123</code>
 
-`!whelp`
+<code>!whelp</code>
 Show this help message
 
-*Supported URLs:*
-• GitLab: `http://host/group/project/-/merge_requests/N`
-• GitHub: `https://github.com/owner/repo/pull/N`"""
+<b>Supported URLs:</b>
+• GitLab: <code>http://host/group/project/-/merge_requests/N</code>
+• GitHub: <code>https://github.com/owner/repo/pull/N</code>"""
     
-    await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
 
 def main() -> None:

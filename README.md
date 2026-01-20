@@ -8,7 +8,7 @@ A Telegram bot that manages task queues for GitLab/GitHub merge requests in chan
 |---------|-------------|
 | `!wadd <MR/PR URL> @username` | Add a merge request and assign it to a user |
 | `!w` | List all tasks in the queue |
-| `!wdone <task_id>` | Remove a task by its ID |
+| `!wdone <N or task_id>` | Remove a task by sequence number or task ID |
 | `!whelp` | Show help instructions |
 
 ## Task IDs
@@ -61,20 +61,23 @@ python bot.py
 !wadd http://gitlab.example.com/group/monorepo/-/merge_requests/120 @alice
 
 # Response:
-# monorepo/merge_requests/120 → @alice
+# [#1] monorepo/merge_requests/120 → @alice
 
 # List all tasks
 !w
 
 # Response:
-# monorepo/merge_requests/120 → @alice (by @bob)
-# backend/pull/45 → @charlie (by @bob)
+# [#1] monorepo/merge_requests/120 → @alice (by @bob)
+# [#2] backend/pull/45 → @charlie (by @bob)
 
-# Mark task as done
-!wdone monorepo/merge_requests/120
+# Mark task as done (by number or task ID)
+!wdone 1
 
 # Response:
-# Removed monorepo/merge_requests/120 (added by @bob)
+# Removed [#1] monorepo/merge_requests/120 (added by @bob)
+
+# Or by task ID:
+!wdone backend/pull/45
 ```
 
 ## Supported URLs
