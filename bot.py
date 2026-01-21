@@ -9,6 +9,8 @@ from telegram.constants import ParseMode
 from html import escape as html_escape
 
 from database import Database
+from scheduler import add_reminder_job, remove_reminder_job, setup_scheduler
+from apscheduler.triggers.cron import CronTrigger
 
 # Load environment variables
 load_dotenv()
@@ -31,6 +33,10 @@ W_PATTERN = re.compile(r"^!w$", re.IGNORECASE)
 WDONE_PATTERN = re.compile(r"^!wdone\s+(.+)$", re.IGNORECASE)
 WDONE_PREFIX = re.compile(r"^!wdone\b", re.IGNORECASE)
 WHELP_PATTERN = re.compile(r"^!whelp$", re.IGNORECASE)
+WREMINDER_STATUS_PATTERN = re.compile(r"^!wreminder$", re.IGNORECASE)
+WREMINDER_SET_PATTERN = re.compile(r"^!wreminder-set\s+(.+)$", re.IGNORECASE)
+WREMINDER_OFF_PATTERN = re.compile(r"^!wreminder-off$", re.IGNORECASE)
+WREMINDER_REMOVE_PATTERN = re.compile(r"^!wreminder-remove$", re.IGNORECASE)
 
 # Patterns for extracting task ID from MR/PR URLs
 # GitLab: http://host/group/project/-/merge_requests/123
@@ -174,6 +180,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if WHELP_PATTERN.match(text):
         await handle_whelp(update)
         return
+    
+    # Check for !wreminder command
+    if WREMINDER_STATUS_PATTERN.match(text):
+        await handle_wreminder_status(update, chat_id)
+        return
+    
+    # Check for !wreminder-set command
+    wreminder_set_match = WREMINDER_SET_PATTERN.match(text)
+    if wreminder_set_match:
+        cron_expression = wreminder_set_match.group(1).strip()
+        await handle_wreminder_set(update, chat_id, cron_expression)
+        return
+    
+    # Check for !wreminder-off command
+    if WREMINDER_OFF_PATTERN.match(text):
+        await handle_wreminder_off(update, chat_id)
+        return
+    
+    # Check for !wreminder-remove command
+    if WREMINDER_REMOVE_PATTERN.match(text):
+        await handle_wreminder_remove(update, chat_id)
+        return
 
 
 async def handle_wadd(update: Update, chat_id: int, url: str, assigned_to: Optional[str], created_by: str) -> None:
@@ -260,14 +288,173 @@ List all tasks in the queue
 Remove a completed task by number or ID
 Examples: <code>!wdone 1</code>, <code>!wdone #1</code>, or <code>!wdone repo/merge_requests/123</code>
 
+<code>!wreminder-set &lt;cron_expression&gt;</code>
+Set automatic reminder (5-part cron format, UTC time)
+Examples:
+• <code>!wreminder-set 0 9 * * *</code> (daily at 9 AM UTC)
+• <code>!wreminder-set 0 9,17 * * 1-5</code> (weekdays at 9 AM & 5 PM)
+
+<code>!wreminder</code>
+Show current reminder configuration
+
+<code>!wreminder-off</code>
+Disable reminder (keeps configuration)
+
+<code>!wreminder-remove</code>
+Delete reminder configuration
+
 <code>!whelp</code>
 Show this help message
 
 <b>Supported URLs:</b>
 • GitLab: <code>http://host/group/project/-/merge_requests/N</code>
-• GitHub: <code>https://github.com/owner/repo/pull/N</code>"""
+• GitHub: <code>https://github.com/owner/repo/pull/N</code>
+
+<b>Cron Format:</b> <code>* * * * *</code> = minute hour day month day_of_week"""
     
     await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
+
+
+async def handle_wreminder_status(update: Update, chat_id: int) -> None:
+    """Handle !wreminder command - show current reminder configuration."""
+    reminder = db.get_reminder(chat_id)
+    
+    if reminder is None:
+        await update.message.reply_text(
+            "No reminder configured for this chat.\n\n"
+            "Use <code>!wreminder-set &lt;cron_expression&gt;</code> to set one.\n"
+            "Example: <code>!wreminder-set 0 9 * * *</code> (daily at 9 AM UTC)",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    status = "✅ Enabled" if reminder.enabled else "⏸ Disabled"
+    response = f"""<b>Reminder Configuration</b>
+
+Status: {status}
+Schedule: <code>{html_escape(reminder.cron_expression)}</code>
+Timezone: UTC
+Created: {reminder.created_at}
+Updated: {reminder.updated_at}
+
+Use <code>!wreminder-off</code> to disable or <code>!wreminder-remove</code> to delete."""
+    
+    await update.message.reply_text(response, parse_mode=ParseMode.HTML)
+
+
+async def handle_wreminder_set(update: Update, chat_id: int, cron_expression: str) -> None:
+    """Handle !wreminder-set command - set or update reminder schedule."""
+    # Validate cron expression
+    parts = cron_expression.split()
+    if len(parts) != 5:
+        await update.message.reply_text(
+            "❌ Invalid cron expression. Must have 5 parts: minute hour day month day_of_week\n\n"
+            "<b>Format:</b> <code>* * * * *</code>\n"
+            "         ↓ ↓ ↓ ↓ ↓\n"
+            "         │ │ │ │ └─ Day of week (0-6, 0=Sunday)\n"
+            "         │ │ │ └─── Month (1-12)\n"
+            "         │ │ └───── Day (1-31)\n"
+            "         │ └─────── Hour (0-23)\n"
+            "         └───────── Minute (0-59)\n\n"
+            "<b>Examples:</b>\n"
+            "• <code>0 9 * * *</code> - Daily at 9 AM UTC\n"
+            "• <code>0 9,17 * * *</code> - Daily at 9 AM & 5 PM UTC\n"
+            "• <code>0 9 * * 1-5</code> - Weekdays at 9 AM UTC\n"
+            "• <code>0 */4 * * *</code> - Every 4 hours",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    # Try to validate with APScheduler
+    try:
+        minute, hour, day, month, day_of_week = parts
+        CronTrigger(
+            minute=minute,
+            hour=hour,
+            day=day,
+            month=month,
+            day_of_week=day_of_week,
+            timezone='UTC'
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Invalid cron expression: {html_escape(str(e))}\n\n"
+            "Please check your expression and try again.\n"
+            "Example: <code>!wreminder-set 0 9 * * *</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    # Save to database
+    db.set_reminder(chat_id, cron_expression, enabled=True)
+    
+    # Add/update scheduler job
+    try:
+        # Get the application from the context
+        application = update.get_bot()._application
+        add_reminder_job(chat_id, cron_expression, application, db)
+        
+        await update.message.reply_text(
+            f"✅ Reminder set successfully!\n\n"
+            f"Schedule: <code>{html_escape(cron_expression)}</code>\n"
+            f"Timezone: UTC\n\n"
+            f"You'll receive reminders when there are pending tasks.\n"
+            f"Use <code>!wreminder</code> to check status.",
+            parse_mode=ParseMode.HTML
+        )
+        logger.info(f"Set reminder for chat {chat_id}: {cron_expression}")
+        
+    except Exception as e:
+        logger.error(f"Error setting reminder for chat {chat_id}: {e}", exc_info=True)
+        await update.message.reply_text(
+            "❌ Error setting reminder. Please try again later.",
+            parse_mode=ParseMode.HTML
+        )
+
+
+async def handle_wreminder_off(update: Update, chat_id: int) -> None:
+    """Handle !wreminder-off command - disable reminder."""
+    success = db.disable_reminder(chat_id)
+    
+    if not success:
+        await update.message.reply_text(
+            "No reminder configured for this chat.\n"
+            "Use <code>!wreminder-set &lt;cron_expression&gt;</code> to set one.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    # Remove from scheduler
+    remove_reminder_job(chat_id)
+    
+    await update.message.reply_text(
+        "⏸ Reminder disabled.\n\n"
+        "Your configuration is saved. Use <code>!wreminder-set &lt;cron_expression&gt;</code> to re-enable.",
+        parse_mode=ParseMode.HTML
+    )
+    logger.info(f"Disabled reminder for chat {chat_id}")
+
+
+async def handle_wreminder_remove(update: Update, chat_id: int) -> None:
+    """Handle !wreminder-remove command - delete reminder configuration."""
+    success = db.delete_reminder(chat_id)
+    
+    if not success:
+        await update.message.reply_text(
+            "No reminder configured for this chat.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    # Remove from scheduler
+    remove_reminder_job(chat_id)
+    
+    await update.message.reply_text(
+        "🗑 Reminder configuration deleted.\n\n"
+        "Use <code>!wreminder-set &lt;cron_expression&gt;</code> to create a new one.",
+        parse_mode=ParseMode.HTML
+    )
+    logger.info(f"Removed reminder for chat {chat_id}")
 
 
 def main() -> None:
@@ -285,6 +472,10 @@ def main() -> None:
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
+    
+    # Setup and start the reminder scheduler
+    setup_scheduler(application, db)
+    logger.info("Reminder scheduler initialized")
     
     # Start polling
     logger.info("Starting bot...")

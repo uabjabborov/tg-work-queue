@@ -21,6 +21,15 @@ class Task:
     created_at: datetime
 
 
+@dataclass
+class Reminder:
+    chat_id: int
+    cron_expression: str
+    enabled: bool
+    created_at: datetime
+    updated_at: datetime
+
+
 class Database:
     def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
@@ -53,6 +62,15 @@ class Database:
                 CREATE TABLE IF NOT EXISTS seq_counters (
                     chat_id INTEGER PRIMARY KEY,
                     next_num INTEGER DEFAULT 1
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS reminders (
+                    chat_id INTEGER PRIMARY KEY,
+                    cron_expression TEXT NOT NULL,
+                    enabled BOOLEAN NOT NULL DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             conn.commit()
@@ -180,3 +198,84 @@ class Database:
             )
             conn.commit()
             return task
+
+    def set_reminder(self, chat_id: int, cron_expression: str, enabled: bool = True) -> None:
+        """Set or update a reminder configuration for a chat."""
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO reminders (chat_id, cron_expression, enabled, created_at, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    cron_expression = excluded.cron_expression,
+                    enabled = excluded.enabled,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (chat_id, cron_expression, enabled)
+            )
+            conn.commit()
+
+    def get_reminder(self, chat_id: int) -> Optional[Reminder]:
+        """Get reminder configuration for a chat."""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT chat_id, cron_expression, enabled, created_at, updated_at
+                FROM reminders
+                WHERE chat_id = ?
+                """,
+                (chat_id,)
+            )
+            row = cursor.fetchone()
+            
+            if row is None:
+                return None
+            
+            return Reminder(
+                chat_id=row["chat_id"],
+                cron_expression=row["cron_expression"],
+                enabled=bool(row["enabled"]),
+                created_at=row["created_at"],
+                updated_at=row["updated_at"]
+            )
+
+    def get_all_active_reminders(self) -> list[Reminder]:
+        """Get all enabled reminders."""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT chat_id, cron_expression, enabled, created_at, updated_at
+                FROM reminders
+                WHERE enabled = 1
+                """
+            )
+            return [
+                Reminder(
+                    chat_id=row["chat_id"],
+                    cron_expression=row["cron_expression"],
+                    enabled=bool(row["enabled"]),
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"]
+                )
+                for row in cursor.fetchall()
+            ]
+
+    def disable_reminder(self, chat_id: int) -> bool:
+        """Disable a reminder without deleting it. Returns True if reminder exists, False otherwise."""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                "UPDATE reminders SET enabled = 0, updated_at = CURRENT_TIMESTAMP WHERE chat_id = ?",
+                (chat_id,)
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def delete_reminder(self, chat_id: int) -> bool:
+        """Delete a reminder configuration. Returns True if reminder existed, False otherwise."""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                "DELETE FROM reminders WHERE chat_id = ?",
+                (chat_id,)
+            )
+            conn.commit()
+            return cursor.rowcount > 0
