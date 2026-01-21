@@ -190,7 +190,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     wreminder_set_match = WREMINDER_SET_PATTERN.match(text)
     if wreminder_set_match:
         cron_expression = wreminder_set_match.group(1).strip()
-        await handle_wreminder_set(update, chat_id, cron_expression)
+        await handle_wreminder_set(update, context, chat_id, cron_expression)
         return
     
     # Check for !wreminder-off command
@@ -342,7 +342,7 @@ Use <code>!wreminder-off</code> to disable or <code>!wreminder-remove</code> to 
     await update.message.reply_text(response, parse_mode=ParseMode.HTML)
 
 
-async def handle_wreminder_set(update: Update, chat_id: int, cron_expression: str) -> None:
+async def handle_wreminder_set(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, cron_expression: str) -> None:
     """Handle !wreminder-set command - set or update reminder schedule."""
     # Validate cron expression
     parts = cron_expression.split()
@@ -391,8 +391,7 @@ async def handle_wreminder_set(update: Update, chat_id: int, cron_expression: st
     # Add/update scheduler job
     try:
         # Get the application from the context
-        application = update.get_bot()._application
-        add_reminder_job(chat_id, cron_expression, application, db)
+        add_reminder_job(chat_id, cron_expression, context.application, db)
         
         await update.message.reply_text(
             f"✅ Reminder set successfully!\n\n"
