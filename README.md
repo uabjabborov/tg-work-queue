@@ -118,7 +118,7 @@ python bot.py
 # Timezone: UTC
 
 # Set weekday reminders at 9 AM and 5 PM UTC
-!wreminder-set 0 9,17 * * 1-5
+!wreminder-set 0 9,17 * * 0-4
 
 # Check current configuration
 !wreminder
@@ -143,17 +143,19 @@ python bot.py
 
 ## Cron Expression Format
 
-Reminders use standard 5-part cron expressions in UTC timezone:
+Reminders use 5-part cron expressions in UTC timezone:
 
 ```
 * * * * *
 │ │ │ │ │
-│ │ │ │ └─── Day of week (0-6, Sunday=0)
+│ │ │ │ └─── Day of week (0-6, 0=Monday, 1=Tuesday, ..., 6=Sunday)
 │ │ │ └───── Month (1-12)
 │ │ └─────── Day of month (1-31)
 │ └───────── Hour (0-23)
 └─────────── Minute (0-59)
 ```
+
+**Note:** Day of week uses 0=Monday (not Sunday like standard cron).
 
 ### Examples:
 
@@ -161,12 +163,13 @@ Reminders use standard 5-part cron expressions in UTC timezone:
 |------------|-------------|
 | `0 9 * * *` | Daily at 9:00 AM UTC |
 | `0 9,17 * * *` | Daily at 9:00 AM and 5:00 PM UTC |
-| `0 9 * * 1-5` | Weekdays (Mon-Fri) at 9:00 AM UTC |
+| `0 9 * * 0-4` | Weekdays (Mon-Fri) at 9:00 AM UTC |
+| `0 9 * * 5,6` | Weekends (Sat, Sun) at 9:00 AM UTC |
 | `0 */4 * * *` | Every 4 hours |
 | `*/30 9-17 * * *` | Every 30 minutes between 9 AM-5 PM UTC |
-| `0 0 * * 0` | Every Sunday at midnight UTC |
+| `0 0 * * 6` | Every Sunday at midnight UTC |
 
-**Note:** Calculate your local time to UTC. For example, if you're in GMT+5 and want 9 AM local time, use `0 4 * * *` (4 AM UTC).
+**Timezone Note:** Calculate your local time to UTC. For example, if you're in GMT+5 and want 9 AM local time, use `0 4 * * *` (4 AM UTC).
 
 ## Reminder Behavior
 

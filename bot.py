@@ -292,7 +292,7 @@ Examples: <code>!wdone 1</code>, <code>!wdone #1</code>, or <code>!wdone repo/me
 Set automatic reminder (5-part cron format, UTC time)
 Examples:
 • <code>!wreminder-set 0 9 * * *</code> (daily at 9 AM UTC)
-• <code>!wreminder-set 0 9,17 * * 1-5</code> (weekdays at 9 AM & 5 PM)
+• <code>!wreminder-set 0 9,17 * * 0-4</code> (weekdays at 9 AM & 5 PM)
 
 <code>!wreminder</code>
 Show current reminder configuration
@@ -310,7 +310,8 @@ Show this help message
 • GitLab: <code>http://host/group/project/-/merge_requests/N</code>
 • GitHub: <code>https://github.com/owner/repo/pull/N</code>
 
-<b>Cron Format:</b> <code>* * * * *</code> = minute hour day month day_of_week"""
+<b>Cron Format:</b> <code>* * * * *</code> = minute hour day month day_of_week
+<b>Day of week:</b> 0=Monday, 1=Tuesday, ..., 6=Sunday"""
     
     await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
@@ -351,7 +352,7 @@ async def handle_wreminder_set(update: Update, context: ContextTypes.DEFAULT_TYP
             "❌ Invalid cron expression. Must have 5 parts: minute hour day month day_of_week\n\n"
             "<b>Format:</b> <code>* * * * *</code>\n"
             "         ↓ ↓ ↓ ↓ ↓\n"
-            "         │ │ │ │ └─ Day of week (0-6, 0=Sunday)\n"
+            "         │ │ │ │ └─ Day of week (0-6, 0=Mon, 6=Sun)\n"
             "         │ │ │ └─── Month (1-12)\n"
             "         │ │ └───── Day (1-31)\n"
             "         │ └─────── Hour (0-23)\n"
@@ -359,7 +360,7 @@ async def handle_wreminder_set(update: Update, context: ContextTypes.DEFAULT_TYP
             "<b>Examples:</b>\n"
             "• <code>0 9 * * *</code> - Daily at 9 AM UTC\n"
             "• <code>0 9,17 * * *</code> - Daily at 9 AM & 5 PM UTC\n"
-            "• <code>0 9 * * 1-5</code> - Weekdays at 9 AM UTC\n"
+            "• <code>0 9 * * 0-4</code> - Weekdays at 9 AM UTC\n"
             "• <code>0 */4 * * *</code> - Every 4 hours",
             parse_mode=ParseMode.HTML
         )
