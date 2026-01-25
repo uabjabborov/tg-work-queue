@@ -199,6 +199,74 @@ class Database:
             conn.commit()
             return task
 
+    def update_task_assignee_by_seq(self, chat_id: int, seq_num: int, assigned_to: str) -> Optional[Task]:
+        """Update a task's assignee by sequence number and return the updated task, or None if not found."""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT id, chat_id, seq_num, task_id, url, assigned_to, created_by, created_at
+                FROM tasks
+                WHERE chat_id = ? AND seq_num = ?
+                """,
+                (chat_id, seq_num)
+            )
+            row = cursor.fetchone()
+            
+            if row is None:
+                return None
+            
+            conn.execute(
+                "UPDATE tasks SET assigned_to = ? WHERE chat_id = ? AND seq_num = ?",
+                (assigned_to, chat_id, seq_num)
+            )
+            conn.commit()
+            
+            # Return updated task
+            cursor = conn.execute(
+                """
+                SELECT id, chat_id, seq_num, task_id, url, assigned_to, created_by, created_at
+                FROM tasks
+                WHERE chat_id = ? AND seq_num = ?
+                """,
+                (chat_id, seq_num)
+            )
+            row = cursor.fetchone()
+            return self._row_to_task(row)
+
+    def update_task_assignee_by_id(self, chat_id: int, task_id: str, assigned_to: str) -> Optional[Task]:
+        """Update a task's assignee by task_id and return the updated task, or None if not found."""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT id, chat_id, seq_num, task_id, url, assigned_to, created_by, created_at
+                FROM tasks
+                WHERE chat_id = ? AND task_id = ?
+                """,
+                (chat_id, task_id)
+            )
+            row = cursor.fetchone()
+            
+            if row is None:
+                return None
+            
+            conn.execute(
+                "UPDATE tasks SET assigned_to = ? WHERE chat_id = ? AND task_id = ?",
+                (assigned_to, chat_id, task_id)
+            )
+            conn.commit()
+            
+            # Return updated task
+            cursor = conn.execute(
+                """
+                SELECT id, chat_id, seq_num, task_id, url, assigned_to, created_by, created_at
+                FROM tasks
+                WHERE chat_id = ? AND task_id = ?
+                """,
+                (chat_id, task_id)
+            )
+            row = cursor.fetchone()
+            return self._row_to_task(row)
+
     def set_reminder(self, chat_id: int, cron_expression: str, enabled: bool = True) -> None:
         """Set or update a reminder configuration for a chat."""
         with self._get_connection() as conn:

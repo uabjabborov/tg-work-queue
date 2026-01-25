@@ -37,6 +37,8 @@ WREMINDER_STATUS_PATTERN = re.compile(r"^!wreminder$", re.IGNORECASE)
 WREMINDER_SET_PATTERN = re.compile(r"^!wreminder-set\s+(.+)$", re.IGNORECASE)
 WREMINDER_OFF_PATTERN = re.compile(r"^!wreminder-off$", re.IGNORECASE)
 WREMINDER_REMOVE_PATTERN = re.compile(r"^!wreminder-remove$", re.IGNORECASE)
+WASSIGN_PATTERN = re.compile(r"^!wassign\s+(.+?)\s+@(\w+)$", re.IGNORECASE)
+WASSIGN_PREFIX = re.compile(r"^!wassign\b", re.IGNORECASE)
 
 # Patterns for extracting task ID from MR/PR URLs
 # GitLab: http://host/group/project/-/merge_requests/123
@@ -202,6 +204,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if WREMINDER_REMOVE_PATTERN.match(text):
         await handle_wreminder_remove(update, chat_id)
         return
+    
+    # Check for !wassign command
+    wassign_match = WASSIGN_PATTERN.match(text)
+    if wassign_match:
+        task_ref = wassign_match.group(1).strip()
+        assigned_to = wassign_match.group(2)
+        await handle_wassign(update, chat_id, task_ref, assigned_to)
+        return
+    elif WASSIGN_PREFIX.match(text):
+        await update.message.reply_text(
+            "Usage: <code>!wassign &lt;N or task_id&gt; @username</code>\n"
+            "Examples:\n"
+            "• <code>!wassign 1 @alice</code>\n"
+            "• <code>!wassign #1 @alice</code>\n"
+            "• <code>!wassign repo/merge_requests/123 @alice</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
 
 
 async def handle_wadd(update: Update, chat_id: int, url: str, assigned_to: Optional[str], created_by: str) -> None:
@@ -287,6 +307,10 @@ List all tasks in the queue
 <code>!wdone &lt;N or task_id&gt;</code>
 Remove a completed task by number or ID
 Examples: <code>!wdone 1</code>, <code>!wdone #1</code>, or <code>!wdone repo/merge_requests/123</code>
+
+<code>!wassign &lt;N or task_id&gt; @username</code>
+Assign or reassign a task to a user
+Examples: <code>!wassign 1 @alice</code>, <code>!wassign #2 @bob</code>, or <code>!wassign repo/pull/45 @charlie</code>
 
 <code>!wreminder-set &lt;cron_expression&gt;</code>
 Set automatic reminder (5-part cron format, UTC time)
@@ -455,6 +479,28 @@ async def handle_wreminder_remove(update: Update, chat_id: int) -> None:
         parse_mode=ParseMode.HTML
     )
     logger.info(f"Removed reminder for chat {chat_id}")
+
+
+async def handle_wassign(update: Update, chat_id: int, task_ref: str, assigned_to: str) -> None:
+    """Handle !wassign command - assign or reassign a task to a user."""
+    # Strip # prefix if present
+    task_ref_clean = task_ref.lstrip('#')
+    
+    assigned_to_formatted = f"@{assigned_to}"
+    
+    # Try to parse as sequence number first
+    if task_ref_clean.isdigit():
+        updated_task = db.update_task_assignee_by_seq(chat_id, int(task_ref_clean), assigned_to_formatted)
+    else:
+        updated_task = db.update_task_assignee_by_id(chat_id, task_ref, assigned_to_formatted)
+    
+    if updated_task is None:
+        await update.message.reply_text(f"Task {task_ref} not found.")
+        return
+    
+    response = f'[#{updated_task.seq_num}] <a href="{html_escape(updated_task.url)}">{html_escape(updated_task.task_id)}</a> → {html_escape(assigned_to_formatted)}'
+    await update.message.reply_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    logger.info(f"Assigned task #{updated_task.seq_num} ({updated_task.task_id}) to {assigned_to_formatted} in chat {chat_id}")
 
 
 def main() -> None:
