@@ -127,21 +127,21 @@ def validate_wadd_args(text: str) -> str:
 def extract_task_id(url: str) -> str | None:
     """Extract task ID from a GitLab MR or GitHub PR URL.
     
-    Returns format: repo/merge_requests/N or repo/pull/N
+    Returns format: repo!N
     """
     # Try GitLab pattern
     gitlab_match = GITLAB_MR_PATTERN.match(url)
     if gitlab_match:
         repo = gitlab_match.group(1)
         mr_number = gitlab_match.group(2)
-        return f"{repo}/merge_requests/{mr_number}"
+        return f"{repo}!{mr_number}"
     
     # Try GitHub pattern
     github_match = GITHUB_PR_PATTERN.match(url)
     if github_match:
         repo = github_match.group(1)
         pr_number = github_match.group(2)
-        return f"{repo}/pull/{pr_number}"
+        return f"{repo}!{pr_number}"
     
     return None
 
@@ -191,7 +191,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif WDONE_PREFIX.match(text):
         await update.message.reply_text(
             "Usage: <code>!wdone &lt;N or task_id&gt;</code>\n"
-            "Examples: <code>!wdone 1</code>, <code>!wdone #1</code>, or <code>!wdone repo/merge_requests/123</code>",
+            "Examples: <code>!wdone 1</code>, <code>!wdone #1</code>, or <code>!wdone repo!123</code>",
             parse_mode=ParseMode.HTML
         )
         return
@@ -237,7 +237,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "Examples:\n"
             "• <code>!wassign 1 @alice</code>\n"
             "• <code>!wassign #1 @alice @bob</code>\n"
-            "• <code>!wassign repo/merge_requests/123 @alice @bob @charlie</code>",
+            "• <code>!wassign repo!123 @alice @bob @charlie</code>",
             parse_mode=ParseMode.HTML
         )
         return
@@ -329,11 +329,11 @@ List all tasks in the queue
 
 <code>!wdone &lt;N or task_id&gt;</code>
 Remove a completed task by number or ID
-Examples: <code>!wdone 1</code>, <code>!wdone #1</code>, or <code>!wdone repo/merge_requests/123</code>
+Examples: <code>!wdone 1</code>, <code>!wdone #1</code>, or <code>!wdone repo!123</code>
 
 <code>!wassign &lt;N or task_id&gt; @username [...]</code>
 Assign or reassign task (replaces all existing assignees)
-Examples: <code>!wassign 1 @alice</code>, <code>!wassign #2 @bob @charlie</code>, or <code>!wassign repo/pull/45 @alice @bob</code>
+Examples: <code>!wassign 1 @alice</code>, <code>!wassign #2 @bob @charlie</code>, or <code>!wassign repo!45 @alice @bob</code>
 
 <code>!wreminder-set &lt;cron_expression&gt;</code>
 Set automatic reminder (5-part cron format, UTC time)
