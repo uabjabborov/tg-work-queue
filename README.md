@@ -8,9 +8,10 @@ A Telegram bot that manages task queues for GitLab/GitHub merge requests in chan
 
 | Command | Description |
 |---------|-------------|
-| `!wadd <MR/PR URL> [@username]` | Add a merge request (optionally assign to a user) |
+| `!wadd <MR/PR URL> [@username ...]` | Add a merge request (optionally assign to one or more users) |
 | `!w` | List all tasks in the queue |
 | `!wdone <N or task_id>` | Remove a task by sequence number or task ID |
+| `!wassign <N or task_id> @username [...]` | Assign or reassign a task (replaces all existing assignees) |
 | `!whelp` | Show help instructions |
 
 ### Reminders
@@ -60,8 +61,26 @@ This includes:
 
 ### 4. Run the Bot
 
+#### Option A: Run Directly
+
 ```bash
 python bot.py
+```
+
+#### Option B: Run with Docker
+
+```bash
+# Build the image
+docker-compose build
+
+# Start the bot
+docker-compose up -d
+
+# View logs
+docker-compose logs -f
+
+# Stop the bot
+docker-compose down
 ```
 
 ### 5. Add Bot to Channel/Group
@@ -81,18 +100,32 @@ python bot.py
 # Response:
 # [#1] monorepo/merge_requests/120
 
-# Add a task with assignee
+# Add a task with single assignee
 !wadd http://gitlab.example.com/group/monorepo/-/merge_requests/120 @alice
 
 # Response:
 # [#1] monorepo/merge_requests/120 → @alice
 
+# Add a task with multiple assignees
+!wadd http://gitlab.example.com/group/monorepo/-/merge_requests/120 @alice @bob @charlie
+
+# Response:
+# [#1] monorepo/merge_requests/120 → @alice, @bob, @charlie
+
 # List all tasks
 !w
 
 # Response:
-# [#1] monorepo/merge_requests/120 → @alice (by @bob)
-# [#2] backend/pull/45 (by @bob)
+# [#1] monorepo/merge_requests/120 → @alice, @bob (by @dave)
+# [#2] backend/pull/45 (by @dave)
+
+# Assign or reassign a task (replaces all existing assignees)
+!wassign 1 @eve
+# Or with # prefix:
+!wassign #1 @eve @frank
+
+# Response:
+# [#1] monorepo/merge_requests/120 → @eve, @frank
 
 # Mark task as done (by number or task ID)
 !wdone 1
@@ -100,7 +133,7 @@ python bot.py
 !wdone #1
 
 # Response:
-# Removed [#1] monorepo/merge_requests/120 (added by @bob)
+# Removed [#1] monorepo/merge_requests/120 (added by @dave)
 
 # Or by task ID:
 !wdone backend/pull/45
@@ -178,10 +211,18 @@ Reminders use 5-part cron expressions in UTC timezone:
 - Reminders persist across bot restarts
 - You can temporarily disable reminders without losing the configuration
 
+## Features
+
+- **Multiple Assignees**: Assign tasks to multiple team members
+- **Isolated Queues**: Each channel/group has its own independent task queue
+- **Unique Tasks**: Task IDs are unique per channel (same MR can't be added twice)
+- **Clickable Links**: Tasks are displayed as clickable links to the MR/PR
+- **Custom Reminders**: Each channel can configure its own reminder schedule
+- **Persistent Storage**: Data is stored in SQLite database (`workqueue.db`)
+- **Flexible Assignment**: Reassign tasks at any time, replacing all existing assignees
+
 ## Notes
 
-- Each channel/group has its own isolated task queue
-- Task IDs are unique per channel (same MR can't be added twice)
-- Tasks are displayed as clickable links
-- Each channel can configure its own reminder schedule
-- The bot stores data in `workqueue.db` (SQLite)
+- **Task Assignment**: Use `!wassign` to change assignees - this replaces all existing assignees with the new ones
+- **Task Removal**: When a task is removed, all its assignees are automatically cleaned up
+- **Migration**: Existing single-assignee tasks are automatically migrated to support multiple assignees on first run
