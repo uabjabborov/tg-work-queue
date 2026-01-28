@@ -29,8 +29,8 @@ Task IDs are derived from the merge request URL:
 
 | URL | Task ID |
 |-----|---------|
-| `http://gitlab.example.com/group/monorepo/-/merge_requests/120` | `monorepo/merge_requests/120` |
-| `https://github.com/owner/repo/pull/45` | `repo/pull/45` |
+| `http://gitlab.example.com/group/monorepo/-/merge_requests/120` | `monorepo/120` |
+| `https://github.com/owner/repo/pull/45` | `repo/45` |
 
 ## Setup
 
@@ -98,26 +98,26 @@ docker-compose down
 !wadd http://gitlab.example.com/group/monorepo/-/merge_requests/120
 
 # Response:
-# [#1] monorepo/merge_requests/120
+# [#1] monorepo/120
 
 # Add a task with single assignee
 !wadd http://gitlab.example.com/group/monorepo/-/merge_requests/120 @alice
 
 # Response:
-# [#1] monorepo/merge_requests/120 → @alice
+# [#1] monorepo/120 → @alice
 
 # Add a task with multiple assignees
 !wadd http://gitlab.example.com/group/monorepo/-/merge_requests/120 @alice @bob @charlie
 
 # Response:
-# [#1] monorepo/merge_requests/120 → @alice, @bob, @charlie
+# [#1] monorepo/120 → @alice, @bob, @charlie
 
 # List all tasks
 !w
 
 # Response:
-# [#1] monorepo/merge_requests/120 → @alice, @bob (by @dave)
-# [#2] backend/pull/45 (by @dave)
+# [#1] monorepo/120 → @alice, @bob (by @dave)
+# [#2] backend/45 (by @dave)
 
 # Assign or reassign a task (replaces all existing assignees)
 !wassign 1 @eve
@@ -125,7 +125,7 @@ docker-compose down
 !wassign #1 @eve @frank
 
 # Response:
-# [#1] monorepo/merge_requests/120 → @eve, @frank
+# [#1] monorepo/120 → @eve, @frank
 
 # Mark task as done (by number or task ID)
 !wdone 1
@@ -133,10 +133,10 @@ docker-compose down
 !wdone #1
 
 # Response:
-# Removed [#1] monorepo/merge_requests/120 (added by @dave)
+# Removed [#1] monorepo/120 (added by @dave)
 
 # Or by task ID:
-!wdone backend/pull/45
+!wdone backend/45
 ```
 
 ### Reminders
