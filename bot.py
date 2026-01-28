@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 db = Database()
 
 # Regex patterns for commands
-WADD_PATTERN_WITH_USER = re.compile(r"^!wadd\s+(https?://\S+)\s+@(\w+)$", re.IGNORECASE)
+WADD_PATTERN_WITH_USER = re.compile(r"^!wadd\s+(https?://\S+)\s+((?:@\w+\s*)+)$", re.IGNORECASE)
 WADD_PATTERN_NO_USER = re.compile(r"^!wadd\s+(https?://\S+)$", re.IGNORECASE)
 WADD_PREFIX = re.compile(r"^!wadd\b", re.IGNORECASE)
 W_PATTERN = re.compile(r"^!w$", re.IGNORECASE)
@@ -37,7 +37,7 @@ WREMINDER_STATUS_PATTERN = re.compile(r"^!wreminder$", re.IGNORECASE)
 WREMINDER_SET_PATTERN = re.compile(r"^!wreminder-set\s+(.+)$", re.IGNORECASE)
 WREMINDER_OFF_PATTERN = re.compile(r"^!wreminder-off$", re.IGNORECASE)
 WREMINDER_REMOVE_PATTERN = re.compile(r"^!wreminder-remove$", re.IGNORECASE)
-WASSIGN_PATTERN = re.compile(r"^!wassign\s+(.+?)\s+@(\w+)$", re.IGNORECASE)
+WASSIGN_PATTERN = re.compile(r"^!wassign\s+(.+?)\s+((?:@\w+\s*)+)$", re.IGNORECASE)
 WASSIGN_PREFIX = re.compile(r"^!wassign\b", re.IGNORECASE)
 
 # Patterns for extracting task ID from MR/PR URLs
@@ -47,24 +47,40 @@ GITLAB_MR_PATTERN = re.compile(r"https?://[^/]+/(?:.+?/)*([^/]+)/-/merge_request
 GITHUB_PR_PATTERN = re.compile(r"https?://github\.com/[^/]+/([^/]+)/pull/(\d+)")
 
 
+def parse_assignees(assignees_str: str) -> list[str]:
+    """Parse multiple @mentions from a string into a list of formatted usernames.
+    
+    Args:
+        assignees_str: String containing one or more @username mentions
+        
+    Returns:
+        List of usernames with @ prefix (e.g., ['@alice', '@bob'])
+    """
+    # Find all @username patterns
+    mentions = re.findall(r'@(\w+)', assignees_str)
+    # Return with @ prefix
+    return [f"@{mention}" for mention in mentions]
+
+
 def validate_wadd_args(text: str) -> str:
     """Validate !wadd arguments and return specific error message."""
-    parts = text.split(None, 2)  # Split into max 3 parts: !wadd, url, @user (optional)
+    parts = text.split(None, 2)  # Split into max 3 parts: !wadd, url, @user(s) (optional)
     
     if len(parts) == 1:
         # Just "!wadd" with no arguments
         return (
             "Missing URL.\n"
-            "Usage: <code>!wadd &lt;URL&gt; [@username]</code>\n"
+            "Usage: <code>!wadd &lt;URL&gt; [@username ...]</code>\n"
             "Examples:\n"
             "• <code>!wadd http://gitlab.example.com/group/repo/-/merge_requests/123</code>\n"
-            "• <code>!wadd http://gitlab.example.com/group/repo/-/merge_requests/123 @alice</code>"
+            "• <code>!wadd http://gitlab.example.com/group/repo/-/merge_requests/123 @alice</code>\n"
+            "• <code>!wadd http://gitlab.example.com/group/repo/-/merge_requests/123 @alice @bob</code>"
         )
     
     if len(parts) == 2:
         arg = parts[1]
         if arg.startswith("@"):
-            return "Missing URL. Provide a GitLab MR or GitHub PR link before the username."
+            return "Missing URL. Provide a GitLab MR or GitHub PR link before the username(s)."
         elif arg.startswith("http://") or arg.startswith("https://"):
             # URL only is valid, but check if it matches GitLab/GitHub pattern
             if not GITLAB_MR_PATTERN.match(arg) and not GITHUB_PR_PATTERN.match(arg):
@@ -84,13 +100,14 @@ def validate_wadd_args(text: str) -> str:
     
     # len(parts) >= 3, but pattern didn't match
     url_part = parts[1]
-    user_part = parts[2].split()[0] if parts[2] else ""
+    user_part = parts[2]
     
     if not (url_part.startswith("http://") or url_part.startswith("https://")):
         return "Invalid URL. Must start with http:// or https://"
     
-    if not user_part.startswith("@"):
-        return f"Invalid username format. Use <code>@username</code> (got: {html_escape(user_part)})"
+    # Check if user_part contains at least one @username
+    if not re.search(r'@\w+', user_part):
+        return f"Invalid username format. Use <code>@username</code> for each assignee (got: {html_escape(user_part)})"
     
     # URL looks valid but doesn't match GitLab/GitHub pattern
     if not GITLAB_MR_PATTERN.match(url_part) and not GITHUB_PR_PATTERN.match(url_part):
@@ -103,7 +120,7 @@ def validate_wadd_args(text: str) -> str:
     
     return (
         "Invalid command format.\n"
-        "Usage: <code>!wadd &lt;URL&gt; [@username]</code>"
+        "Usage: <code>!wadd &lt;URL&gt; [@username ...]</code>"
     )
 
 
@@ -147,12 +164,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     if wadd_match_with_user:
         url = wadd_match_with_user.group(1)
-        assigned_to = wadd_match_with_user.group(2)
-        await handle_wadd(update, chat_id, url, assigned_to, created_by)
+        assignees_str = wadd_match_with_user.group(2)
+        assignees = parse_assignees(assignees_str)
+        await handle_wadd(update, chat_id, url, assignees, created_by)
         return
     elif wadd_match_no_user:
         url = wadd_match_no_user.group(1)
-        await handle_wadd(update, chat_id, url, None, created_by)
+        await handle_wadd(update, chat_id, url, [], created_by)
         return
     elif WADD_PREFIX.match(text):
         error_msg = validate_wadd_args(text)
@@ -209,22 +227,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     wassign_match = WASSIGN_PATTERN.match(text)
     if wassign_match:
         task_ref = wassign_match.group(1).strip()
-        assigned_to = wassign_match.group(2)
-        await handle_wassign(update, chat_id, task_ref, assigned_to)
+        assignees_str = wassign_match.group(2)
+        assignees = parse_assignees(assignees_str)
+        await handle_wassign(update, chat_id, task_ref, assignees)
         return
     elif WASSIGN_PREFIX.match(text):
         await update.message.reply_text(
-            "Usage: <code>!wassign &lt;N or task_id&gt; @username</code>\n"
+            "Usage: <code>!wassign &lt;N or task_id&gt; @username [...]</code>\n"
             "Examples:\n"
             "• <code>!wassign 1 @alice</code>\n"
-            "• <code>!wassign #1 @alice</code>\n"
-            "• <code>!wassign repo/merge_requests/123 @alice</code>",
+            "• <code>!wassign #1 @alice @bob</code>\n"
+            "• <code>!wassign repo/merge_requests/123 @alice @bob @charlie</code>",
             parse_mode=ParseMode.HTML
         )
         return
 
 
-async def handle_wadd(update: Update, chat_id: int, url: str, assigned_to: Optional[str], created_by: str) -> None:
+async def handle_wadd(update: Update, chat_id: int, url: str, assignees: list[str], created_by: str) -> None:
     """Handle !wadd command - add a new task from MR/PR link."""
     task_id = extract_task_id(url)
     
@@ -237,19 +256,21 @@ async def handle_wadd(update: Update, chat_id: int, url: str, assigned_to: Optio
         )
         return
     
-    assigned_to_formatted = f"@{assigned_to}" if assigned_to else "unassigned"
-    seq_num = db.add_task(chat_id, task_id, url, assigned_to_formatted, created_by)
+    seq_num = db.add_task(chat_id, task_id, url, assignees, created_by)
     
     if seq_num is None:
         await update.message.reply_text(f"Task {task_id} already exists in the queue.")
         return
     
-    if assigned_to:
-        response = f'[#{seq_num}] <a href="{html_escape(url)}">{html_escape(task_id)}</a> → {html_escape(assigned_to_formatted)}'
+    if assignees:
+        assignees_formatted = ", ".join(html_escape(a) for a in assignees)
+        response = f'[#{seq_num}] <a href="{html_escape(url)}">{html_escape(task_id)}</a> → {assignees_formatted}'
     else:
         response = f'[#{seq_num}] <a href="{html_escape(url)}">{html_escape(task_id)}</a>'
     await update.message.reply_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    logger.info(f"Added task {task_id} in chat {chat_id}: {url} -> {assigned_to_formatted}")
+    
+    assignees_log = ", ".join(assignees) if assignees else "unassigned"
+    logger.info(f"Added task {task_id} in chat {chat_id}: {url} -> {assignees_log}")
 
 
 async def handle_w(update: Update, chat_id: int) -> None:
@@ -262,8 +283,9 @@ async def handle_w(update: Update, chat_id: int) -> None:
     
     lines = []
     for t in tasks:
-        if t.assigned_to and t.assigned_to != "unassigned":
-            lines.append(f'[#{t.seq_num}] <a href="{html_escape(t.url)}">{html_escape(t.task_id)}</a> → {html_escape(t.assigned_to)} (by {html_escape(t.created_by)})')
+        if t.assignees:
+            assignees_formatted = ", ".join(html_escape(a) for a in t.assignees)
+            lines.append(f'[#{t.seq_num}] <a href="{html_escape(t.url)}">{html_escape(t.task_id)}</a> → {assignees_formatted} (by {html_escape(t.created_by)})')
         else:
             lines.append(f'[#{t.seq_num}] <a href="{html_escape(t.url)}">{html_escape(t.task_id)}</a> (by {html_escape(t.created_by)})')
     
@@ -295,11 +317,12 @@ async def handle_whelp(update: Update) -> None:
     """Handle !whelp command - display help instructions."""
     help_text = """<b>Work Queue Commands</b>
 
-<code>!wadd &lt;URL&gt; [@username]</code>
-Add a merge request (optionally assign to user)
+<code>!wadd &lt;URL&gt; [@username ...]</code>
+Add a merge request (optionally assign to one or more users)
 Examples:
 • <code>!wadd http://gitlab.example.com/group/repo/-/merge_requests/123</code>
 • <code>!wadd http://gitlab.example.com/group/repo/-/merge_requests/123 @alice</code>
+• <code>!wadd http://gitlab.example.com/group/repo/-/merge_requests/123 @alice @bob</code>
 
 <code>!w</code>
 List all tasks in the queue
@@ -308,9 +331,9 @@ List all tasks in the queue
 Remove a completed task by number or ID
 Examples: <code>!wdone 1</code>, <code>!wdone #1</code>, or <code>!wdone repo/merge_requests/123</code>
 
-<code>!wassign &lt;N or task_id&gt; @username</code>
-Assign or reassign a task to a user
-Examples: <code>!wassign 1 @alice</code>, <code>!wassign #2 @bob</code>, or <code>!wassign repo/pull/45 @charlie</code>
+<code>!wassign &lt;N or task_id&gt; @username [...]</code>
+Assign or reassign task (replaces all existing assignees)
+Examples: <code>!wassign 1 @alice</code>, <code>!wassign #2 @bob @charlie</code>, or <code>!wassign repo/pull/45 @alice @bob</code>
 
 <code>!wreminder-set &lt;cron_expression&gt;</code>
 Set automatic reminder (5-part cron format, UTC time)
@@ -481,26 +504,31 @@ async def handle_wreminder_remove(update: Update, chat_id: int) -> None:
     logger.info(f"Removed reminder for chat {chat_id}")
 
 
-async def handle_wassign(update: Update, chat_id: int, task_ref: str, assigned_to: str) -> None:
-    """Handle !wassign command - assign or reassign a task to a user."""
+async def handle_wassign(update: Update, chat_id: int, task_ref: str, assignees: list[str]) -> None:
+    """Handle !wassign command - assign or reassign a task to one or more users."""
     # Strip # prefix if present
     task_ref_clean = task_ref.lstrip('#')
     
-    assigned_to_formatted = f"@{assigned_to}"
-    
     # Try to parse as sequence number first
     if task_ref_clean.isdigit():
-        updated_task = db.update_task_assignee_by_seq(chat_id, int(task_ref_clean), assigned_to_formatted)
+        updated_task = db.update_task_assignees_by_seq(chat_id, int(task_ref_clean), assignees)
     else:
-        updated_task = db.update_task_assignee_by_id(chat_id, task_ref, assigned_to_formatted)
+        updated_task = db.update_task_assignees_by_id(chat_id, task_ref, assignees)
     
     if updated_task is None:
         await update.message.reply_text(f"Task {task_ref} not found.")
         return
     
-    response = f'[#{updated_task.seq_num}] <a href="{html_escape(updated_task.url)}">{html_escape(updated_task.task_id)}</a> → {html_escape(assigned_to_formatted)}'
+    if assignees:
+        assignees_formatted = ", ".join(html_escape(a) for a in assignees)
+        response = f'[#{updated_task.seq_num}] <a href="{html_escape(updated_task.url)}">{html_escape(updated_task.task_id)}</a> → {assignees_formatted}'
+    else:
+        response = f'[#{updated_task.seq_num}] <a href="{html_escape(updated_task.url)}">{html_escape(updated_task.task_id)}</a> (unassigned)'
+    
     await update.message.reply_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    logger.info(f"Assigned task #{updated_task.seq_num} ({updated_task.task_id}) to {assigned_to_formatted} in chat {chat_id}")
+    
+    assignees_log = ", ".join(assignees) if assignees else "unassigned"
+    logger.info(f"Assigned task #{updated_task.seq_num} ({updated_task.task_id}) to {assignees_log} in chat {chat_id}")
 
 
 def main() -> None:

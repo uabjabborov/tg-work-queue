@@ -36,10 +36,11 @@ async def send_reminder(chat_id: int, application: "Application", db: "Database"
         # Format message similar to handle_w()
         lines = ["<b>📋 Reminder: Pending Reviews</b>\n"]
         for t in tasks:
-            if t.assigned_to and t.assigned_to != "unassigned":
+            if t.assignees:
+                assignees_formatted = ", ".join(html_escape(a) for a in t.assignees)
                 lines.append(
                     f'[#{t.seq_num}] <a href="{html_escape(t.url)}">{html_escape(t.task_id)}</a> → '
-                    f'{html_escape(t.assigned_to)} (by {html_escape(t.created_by)})'
+                    f'{assignees_formatted} (by {html_escape(t.created_by)})'
                 )
             else:
                 lines.append(

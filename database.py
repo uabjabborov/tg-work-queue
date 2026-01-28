@@ -16,7 +16,7 @@ class Task:
     seq_num: int
     task_id: str
     url: str
-    assigned_to: str
+    assignees: list[str]
     created_by: str
     created_at: datetime
 
@@ -59,6 +59,15 @@ class Database:
                 )
             """)
             conn.execute("""
+                CREATE TABLE IF NOT EXISTS task_assignees (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER NOT NULL,
+                    assignee TEXT NOT NULL,
+                    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+                    UNIQUE(task_id, assignee)
+                )
+            """)
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS seq_counters (
                     chat_id INTEGER PRIMARY KEY,
                     next_num INTEGER DEFAULT 1
@@ -74,6 +83,9 @@ class Database:
                 )
             """)
             conn.commit()
+            
+            # Migrate existing assigned_to data to task_assignees table
+            self._migrate_assignees(conn)
 
     def _get_next_seq_num(self, conn: sqlite3.Connection, chat_id: int) -> int:
         cursor = conn.execute(
@@ -96,18 +108,78 @@ class Database:
             )
             return next_num
 
-    def add_task(self, chat_id: int, task_id: str, url: str, assigned_to: str, created_by: str) -> Optional[int]:
+    def _migrate_assignees(self, conn: sqlite3.Connection) -> None:
+        """Migrate existing assigned_to data to task_assignees table."""
+        # Check if migration is needed (task_assignees is empty)
+        cursor = conn.execute("SELECT COUNT(*) as count FROM task_assignees")
+        if cursor.fetchone()["count"] > 0:
+            return  # Already migrated
+        
+        # Get all tasks with assignees
+        cursor = conn.execute("""
+            SELECT id, assigned_to FROM tasks 
+            WHERE assigned_to != 'unassigned' AND assigned_to != ''
+        """)
+        
+        for row in cursor.fetchall():
+            task_id = row["id"]
+            assigned_to = row["assigned_to"]
+            
+            # Insert into task_assignees table
+            try:
+                conn.execute(
+                    "INSERT INTO task_assignees (task_id, assignee) VALUES (?, ?)",
+                    (task_id, assigned_to)
+                )
+            except sqlite3.IntegrityError:
+                pass  # Skip duplicates
+        
+        conn.commit()
+
+    def _get_task_assignees(self, conn: sqlite3.Connection, task_id: int) -> list[str]:
+        """Get all assignees for a task."""
+        cursor = conn.execute(
+            "SELECT assignee FROM task_assignees WHERE task_id = ? ORDER BY assignee",
+            (task_id,)
+        )
+        return [row["assignee"] for row in cursor.fetchall()]
+
+    def _set_task_assignees(self, conn: sqlite3.Connection, task_id: int, assignees: list[str]) -> None:
+        """Replace all assignees for a task."""
+        # Delete existing assignees
+        conn.execute("DELETE FROM task_assignees WHERE task_id = ?", (task_id,))
+        
+        # Insert new assignees
+        for assignee in assignees:
+            if assignee:  # Skip empty strings
+                try:
+                    conn.execute(
+                        "INSERT INTO task_assignees (task_id, assignee) VALUES (?, ?)",
+                        (task_id, assignee)
+                    )
+                except sqlite3.IntegrityError:
+                    pass  # Skip duplicates
+
+    def add_task(self, chat_id: int, task_id: str, url: str, assignees: list[str], created_by: str) -> Optional[int]:
         """Add a task. Returns sequence number if added, None if already exists."""
         try:
             with self._get_connection() as conn:
                 seq_num = self._get_next_seq_num(conn, chat_id)
-                conn.execute(
+                # Keep assigned_to for backward compatibility (use first assignee or 'unassigned')
+                assigned_to = assignees[0] if assignees else "unassigned"
+                
+                cursor = conn.execute(
                     """
                     INSERT INTO tasks (chat_id, seq_num, task_id, url, assigned_to, created_by)
                     VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (chat_id, seq_num, task_id, url, assigned_to, created_by)
                 )
+                
+                # Get the inserted task id and add assignees
+                task_db_id = cursor.lastrowid
+                self._set_task_assignees(conn, task_db_id, assignees)
+                
                 conn.commit()
                 return seq_num
         except sqlite3.IntegrityError:
@@ -125,28 +197,30 @@ class Database:
                 """,
                 (chat_id,)
             )
-            return [
-                Task(
+            tasks = []
+            for row in cursor.fetchall():
+                assignees = self._get_task_assignees(conn, row["id"])
+                tasks.append(Task(
                     id=row["id"],
                     chat_id=row["chat_id"],
                     seq_num=row["seq_num"],
                     task_id=row["task_id"],
                     url=row["url"],
-                    assigned_to=row["assigned_to"],
+                    assignees=assignees,
                     created_by=row["created_by"],
                     created_at=row["created_at"]
-                )
-                for row in cursor.fetchall()
-            ]
+                ))
+            return tasks
 
-    def _row_to_task(self, row: sqlite3.Row) -> Task:
+    def _row_to_task(self, conn: sqlite3.Connection, row: sqlite3.Row) -> Task:
+        assignees = self._get_task_assignees(conn, row["id"])
         return Task(
             id=row["id"],
             chat_id=row["chat_id"],
             seq_num=row["seq_num"],
             task_id=row["task_id"],
             url=row["url"],
-            assigned_to=row["assigned_to"],
+            assignees=assignees,
             created_by=row["created_by"],
             created_at=row["created_at"]
         )
@@ -167,7 +241,7 @@ class Database:
             if row is None:
                 return None
             
-            task = self._row_to_task(row)
+            task = self._row_to_task(conn, row)
             conn.execute(
                 "DELETE FROM tasks WHERE chat_id = ? AND task_id = ?",
                 (chat_id, task_id)
@@ -191,7 +265,7 @@ class Database:
             if row is None:
                 return None
             
-            task = self._row_to_task(row)
+            task = self._row_to_task(conn, row)
             conn.execute(
                 "DELETE FROM tasks WHERE chat_id = ? AND seq_num = ?",
                 (chat_id, seq_num)
@@ -199,8 +273,8 @@ class Database:
             conn.commit()
             return task
 
-    def update_task_assignee_by_seq(self, chat_id: int, seq_num: int, assigned_to: str) -> Optional[Task]:
-        """Update a task's assignee by sequence number and return the updated task, or None if not found."""
+    def update_task_assignees_by_seq(self, chat_id: int, seq_num: int, assignees: list[str]) -> Optional[Task]:
+        """Update a task's assignees by sequence number and return the updated task, or None if not found."""
         with self._get_connection() as conn:
             cursor = conn.execute(
                 """
@@ -215,6 +289,13 @@ class Database:
             if row is None:
                 return None
             
+            task_db_id = row["id"]
+            
+            # Update assignees in junction table
+            self._set_task_assignees(conn, task_db_id, assignees)
+            
+            # Update assigned_to for backward compatibility
+            assigned_to = assignees[0] if assignees else "unassigned"
             conn.execute(
                 "UPDATE tasks SET assigned_to = ? WHERE chat_id = ? AND seq_num = ?",
                 (assigned_to, chat_id, seq_num)
@@ -231,10 +312,10 @@ class Database:
                 (chat_id, seq_num)
             )
             row = cursor.fetchone()
-            return self._row_to_task(row)
+            return self._row_to_task(conn, row)
 
-    def update_task_assignee_by_id(self, chat_id: int, task_id: str, assigned_to: str) -> Optional[Task]:
-        """Update a task's assignee by task_id and return the updated task, or None if not found."""
+    def update_task_assignees_by_id(self, chat_id: int, task_id: str, assignees: list[str]) -> Optional[Task]:
+        """Update a task's assignees by task_id and return the updated task, or None if not found."""
         with self._get_connection() as conn:
             cursor = conn.execute(
                 """
@@ -249,6 +330,13 @@ class Database:
             if row is None:
                 return None
             
+            task_db_id = row["id"]
+            
+            # Update assignees in junction table
+            self._set_task_assignees(conn, task_db_id, assignees)
+            
+            # Update assigned_to for backward compatibility
+            assigned_to = assignees[0] if assignees else "unassigned"
             conn.execute(
                 "UPDATE tasks SET assigned_to = ? WHERE chat_id = ? AND task_id = ?",
                 (assigned_to, chat_id, task_id)
@@ -265,7 +353,7 @@ class Database:
                 (chat_id, task_id)
             )
             row = cursor.fetchone()
-            return self._row_to_task(row)
+            return self._row_to_task(conn, row)
 
     def set_reminder(self, chat_id: int, cron_expression: str, enabled: bool = True) -> None:
         """Set or update a reminder configuration for a chat."""
