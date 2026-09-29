@@ -32,6 +32,8 @@ WADD_PREFIX = re.compile(r"^!wadd\b", re.IGNORECASE)
 W_PATTERN = re.compile(r"^!w$", re.IGNORECASE)
 WDONE_PATTERN = re.compile(r"^!wdone\s+(.+)$", re.IGNORECASE)
 WDONE_PREFIX = re.compile(r"^!wdone\b", re.IGNORECASE)
+WBOUNCE_PATTERN = re.compile(r"^!wbounce\s+(.+)$", re.IGNORECASE)
+WBOUNCE_PREFIX = re.compile(r"^!wbounce\b", re.IGNORECASE)
 WHELP_PATTERN = re.compile(r"^!whelp$", re.IGNORECASE)
 WREMINDER_STATUS_PATTERN = re.compile(r"^!wreminder$", re.IGNORECASE)
 WREMINDER_SET_PATTERN = re.compile(r"^!wreminder-set\s+(.+)$", re.IGNORECASE)
@@ -196,6 +198,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
     
+    # Check for !wbounce command
+    wbounce_match = WBOUNCE_PATTERN.match(text)
+    if wbounce_match:
+        task_ref = wbounce_match.group(1).strip()
+        await handle_wbounce(update, chat_id, task_ref)
+        return
+    elif WBOUNCE_PREFIX.match(text):
+        await update.message.reply_text(
+            "Usage: <code>!wbounce &lt;N or task_id&gt;</code>\n"
+            "Remove a task with a Changes required comment.\n"
+            "Examples: <code>!wbounce 1</code>, <code>!wbounce #1</code>, or <code>!wbounce repo/123</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
     # Check for !whelp command
     if WHELP_PATTERN.match(text):
         await handle_whelp(update)
@@ -295,6 +312,16 @@ async def handle_w(update: Update, chat_id: int) -> None:
 
 async def handle_wdone(update: Update, chat_id: int, task_ref: str) -> None:
     """Handle !wdone command - remove a task by sequence number or task_id."""
+    await handle_remove_task(update, chat_id, task_ref)
+
+
+async def handle_wbounce(update: Update, chat_id: int, task_ref: str) -> None:
+    """Handle !wbounce command - remove a task that requires changes."""
+    await handle_remove_task(update, chat_id, task_ref, comment="Changes required.")
+
+
+async def handle_remove_task(update: Update, chat_id: int, task_ref: str, comment: Optional[str] = None) -> None:
+    """Remove a task and reply with an optional comment."""
     # Strip # prefix if present
     task_ref_clean = task_ref.lstrip('#')
     
@@ -309,6 +336,8 @@ async def handle_wdone(update: Update, chat_id: int, task_ref: str) -> None:
         return
     
     response = f'Removed [#{removed_task.seq_num}] <a href="{html_escape(removed_task.url)}">{html_escape(removed_task.task_id)}</a> (added by {html_escape(removed_task.created_by)})'
+    if comment:
+        response += f"\n{html_escape(comment)}"
     await update.message.reply_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     logger.info(f"Removed task #{removed_task.seq_num} ({removed_task.task_id}) from chat {chat_id}")
 
@@ -330,6 +359,10 @@ List all tasks in the queue
 <code>!wdone &lt;N or task_id&gt;</code>
 Remove a completed task by number or ID
 Examples: <code>!wdone 1</code>, <code>!wdone #1</code>, or <code>!wdone repo/123</code>
+
+<code>!wbounce &lt;N or task_id&gt;</code>
+Remove a task with a Changes required comment
+Examples: <code>!wbounce 1</code>, <code>!wbounce #1</code>, or <code>!wbounce repo/123</code>
 
 <code>!wassign &lt;N or task_id&gt; @username [...]</code>
 Assign or reassign task (replaces all existing assignees)
