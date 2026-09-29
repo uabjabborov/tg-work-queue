@@ -11,6 +11,7 @@ A Telegram bot that manages task queues for GitLab/GitHub merge requests in chan
 | `!wadd <MR/PR URL> [@username ...]` | Add a merge request (optionally assign to one or more users) |
 | `!w` | List all tasks in the queue |
 | `!wdone <N or task_id>` | Remove a task by sequence number or task ID |
+| `!wbounce <N or task_id>` | Remove a task with a "Changes required" comment in the chat |
 | `!wassign <N or task_id> @username [...]` | Assign or reassign a task (replaces all existing assignees) |
 | `!whelp` | Show help instructions |
 
@@ -137,6 +138,17 @@ docker-compose down
 
 # Or by task ID:
 !wdone backend/45
+
+# Remove a task that needs changes (by number or task ID)
+!wbounce 1
+# Or with # prefix:
+!wbounce #1
+# Or by task ID:
+!wbounce monorepo/120
+
+# Response:
+# Removed [#1] monorepo/120 (added by @dave)
+# Changes required.
 ```
 
 ### Reminders
