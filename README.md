@@ -10,9 +10,9 @@ A Telegram bot that manages task queues for GitLab/GitHub merge requests in chan
 |---------|-------------|
 | `!wadd <MR/PR URL> [@username ...]` | Add a merge request (optionally assign to one or more users) |
 | `!w` | List all tasks in the queue |
-| `!wdone <N or task_id>` | Remove a task by sequence number or task ID |
-| `!wbounce <N or task_id>` | Remove a task with a "Changes required" comment in the chat |
-| `!wassign <N or task_id> @username [...]` | Assign or reassign a task (replaces all existing assignees) |
+| `!wdone <PR/MR reference>` | Remove a completed review |
+| `!wbounce <PR/MR reference>` | Remove a review with a "Changes required" comment in the chat |
+| `!wassign <PR/MR reference> @username [...]` | Assign or reassign a review (replaces all existing assignees) |
 | `!whelp` | Show help instructions |
 
 ### Reminders
@@ -24,14 +24,16 @@ A Telegram bot that manages task queues for GitLab/GitHub merge requests in chan
 | `!wreminder-off` | Disable reminder (keeps configuration) |
 | `!wreminder-remove` | Delete reminder configuration |
 
-## Task IDs
+## PR/MR References
 
-Task IDs are derived from the merge request URL:
+PR/MR references are derived from the merge request or pull request URL:
 
-| URL | Task ID |
+| URL | PR/MR reference |
 |-----|---------|
 | `http://gitlab.example.com/group/monorepo/-/merge_requests/120` | `monorepo/120` |
 | `https://github.com/owner/repo/pull/45` | `repo/45` |
+
+Use `repo/N`, the full PR/MR URL, or a bare PR/MR number such as `120` with `!wdone`, `!wbounce`, and `!wassign`. A bare number works only when one review in the current chat has that number. If several reviews have it, use a qualified reference such as `monorepo/120`. Queue sequence numbers and legacy `#N` commands are not accepted; use `!w` to see current references.
 
 ## Setup
 
@@ -99,55 +101,51 @@ docker-compose down
 !wadd http://gitlab.example.com/group/monorepo/-/merge_requests/120
 
 # Response:
-# [#1] monorepo/120
+# monorepo/120 (clickable link)
 
 # Add a task with single assignee
 !wadd http://gitlab.example.com/group/monorepo/-/merge_requests/120 @alice
 
 # Response:
-# [#1] monorepo/120 → @alice
+# monorepo/120 → @alice
 
 # Add a task with multiple assignees
 !wadd http://gitlab.example.com/group/monorepo/-/merge_requests/120 @alice @bob @charlie
 
 # Response:
-# [#1] monorepo/120 → @alice, @bob, @charlie
+# monorepo/120 → @alice, @bob, @charlie
 
 # List all tasks
 !w
 
 # Response:
-# [#1] monorepo/120 → @alice, @bob (by @dave)
-# [#2] backend/45 (by @dave)
+# monorepo/120 → @alice, @bob (by @dave)
+# backend/45 (by @dave)
 
 # Assign or reassign a task (replaces all existing assignees)
-!wassign 1 @eve
-# Or with # prefix:
-!wassign #1 @eve @frank
+!wassign monorepo/120 @eve
+# Or use the PR/MR URL:
+!wassign http://gitlab.example.com/group/monorepo/-/merge_requests/120 @eve @frank
 
 # Response:
-# [#1] monorepo/120 → @eve, @frank
+# monorepo/120 → @eve, @frank
 
-# Mark task as done (by number or task ID)
-!wdone 1
-# Or with # prefix:
-!wdone #1
+# Mark a review as done (by PR/MR number when unambiguous)
+!wdone 120
 
 # Response:
-# Removed [#1] monorepo/120 (added by @dave)
+# Removed monorepo/120 (added by @dave)
 
-# Or by task ID:
+# Or by qualified PR/MR reference:
 !wdone backend/45
 
-# Remove a task that needs changes (by number or task ID)
-!wbounce 1
-# Or with # prefix:
-!wbounce #1
-# Or by task ID:
+# Remove a review that needs changes (by PR/MR reference or URL)
 !wbounce monorepo/120
+# Or by URL:
+!wbounce http://gitlab.example.com/group/monorepo/-/merge_requests/120
 
 # Response:
-# Removed [#1] monorepo/120 (added by @dave)
+# Removed monorepo/120 (added by @dave)
 # Changes required.
 ```
 
@@ -227,7 +225,7 @@ Reminders use 5-part cron expressions in UTC timezone:
 
 - **Multiple Assignees**: Assign tasks to multiple team members
 - **Isolated Queues**: Each channel/group has its own independent task queue
-- **Unique Tasks**: Task IDs are unique per channel (same MR can't be added twice)
+- **Unique Tasks**: PR/MR references are unique per channel (the same MR can't be added twice)
 - **Clickable Links**: Tasks are displayed as clickable links to the MR/PR
 - **Custom Reminders**: Each channel can configure its own reminder schedule
 - **Persistent Storage**: Data is stored in SQLite database (`workqueue.db`)
