@@ -3,7 +3,7 @@ from typing import TYPE_CHECKING
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from telegram.constants import ParseMode
-from presentation import task_listing
+from html import escape as html_escape
 
 if TYPE_CHECKING:
     from telegram.ext import Application
@@ -33,8 +33,20 @@ async def send_reminder(chat_id: int, application: "Application", db: "Database"
             logger.info(f"No pending tasks for chat {chat_id}, skipping reminder")
             return
         
+        # Format message similar to handle_w()
         lines = ["<b>📋 Reminder: Pending Reviews</b>\n"]
-        lines.extend(task_listing(task) for task in tasks)
+        for t in tasks:
+            if t.assignees:
+                assignees_formatted = ", ".join(html_escape(a) for a in t.assignees)
+                lines.append(
+                    f'[#{t.seq_num}] <a href="{html_escape(t.url)}">{html_escape(t.task_id)}</a> → '
+                    f'{assignees_formatted} (by {html_escape(t.created_by)})'
+                )
+            else:
+                lines.append(
+                    f'[#{t.seq_num}] <a href="{html_escape(t.url)}">{html_escape(t.task_id)}</a> '
+                    f'(by {html_escape(t.created_by)})'
+                )
         
         message = "\n".join(lines)
         await application.bot.send_message(

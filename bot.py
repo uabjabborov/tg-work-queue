@@ -2,15 +2,13 @@ import os
 import re
 import logging
 from typing import Optional
-from urllib.parse import urlsplit
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
 from telegram.constants import ParseMode
 from html import escape as html_escape
 
-from database import Database, Task
-from presentation import review_link, task_listing
+from database import Database
 from scheduler import add_reminder_job, remove_reminder_job, setup_scheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -44,13 +42,11 @@ WREMINDER_REMOVE_PATTERN = re.compile(r"^!wreminder-remove$", re.IGNORECASE)
 WASSIGN_PATTERN = re.compile(r"^!wassign\s+(.+?)\s+((?:@\w+\s*)+)$", re.IGNORECASE)
 WASSIGN_PREFIX = re.compile(r"^!wassign\b", re.IGNORECASE)
 
-GITLAB_MR_PATH_PATTERN = re.compile(r"(?P<project>/(?:[^/]+/)*[^/]+)/-/merge_requests/(?P<number>[0-9]+)")
-GITHUB_PR_PATH_PATTERN = re.compile(r"(?P<project>/[^/]+/[^/]+)/pull/(?P<number>[0-9]+)")
-QUALIFIED_REFERENCE_PATTERN = re.compile(r"[^/\s]+/[0-9]+")
-NUMBER_PATTERN = re.compile(r"[0-9]+")
-LEGACY_REFERENCE_PATTERN = re.compile(r"#[0-9]+")
-
-REFERENCE_USAGE = "Use a PR/MR reference such as <code>repo/120</code>, its URL, or an unambiguous PR/MR number. Use <code>!w</code> to see current references."
+# Patterns for extracting task ID from MR/PR URLs
+# GitLab: http://host/group/project/-/merge_requests/123
+GITLAB_MR_PATTERN = re.compile(r"https?://[^/]+/(?:.+?/)*([^/]+)/-/merge_requests/(\d+)")
+# GitHub: https://github.com/owner/repo/pull/123
+GITHUB_PR_PATTERN = re.compile(r"https?://github\.com/[^/]+/([^/]+)/pull/(\d+)")
 
 
 def parse_assignees(assignees_str: str) -> list[str]:
@@ -89,7 +85,7 @@ def validate_wadd_args(text: str) -> str:
             return "Missing URL. Provide a GitLab MR or GitHub PR link before the username(s)."
         elif arg.startswith("http://") or arg.startswith("https://"):
             # URL only is valid, but check if it matches GitLab/GitHub pattern
-            if extract_task_id(arg) is None:
+            if not GITLAB_MR_PATTERN.match(arg) and not GITHUB_PR_PATTERN.match(arg):
                 return (
                     "Unsupported URL format. Must be a GitLab merge request or GitHub pull request.\n"
                     "Supported formats:\n"
@@ -116,7 +112,7 @@ def validate_wadd_args(text: str) -> str:
         return f"Invalid username format. Use <code>@username</code> for each assignee (got: {html_escape(user_part)})"
     
     # URL looks valid but doesn't match GitLab/GitHub pattern
-    if extract_task_id(url_part) is None:
+    if not GITLAB_MR_PATTERN.match(url_part) and not GITHUB_PR_PATTERN.match(url_part):
         return (
             "Unsupported URL format. Must be a GitLab merge request or GitHub pull request.\n"
             "Supported formats:\n"
@@ -130,68 +126,26 @@ def validate_wadd_args(text: str) -> str:
     )
 
 
-def normalize_review_number(number: str) -> str:
-    return number.lstrip("0") or "0"
-
-
-def parse_review_url(url: str) -> tuple[str, tuple[str, str, str]] | None:
-    """Return the display reference and URL identity for a PR/MR link."""
-    try:
-        parsed = urlsplit(url)
-        hostname = parsed.hostname
-        parsed.port
-    except ValueError:
-        return None
-    if parsed.scheme.lower() not in ("http", "https") or not hostname or parsed.username is not None:
-        return None
-
-    path = parsed.path.rstrip("/")
-    if hostname.lower() == "github.com":
-        match = GITHUB_PR_PATH_PATTERN.fullmatch(path)
-    else:
-        match = GITLAB_MR_PATH_PATTERN.fullmatch(path)
-    if match is None:
-        return None
-
-    project = match.group("project")
-    number = match.group("number")
-    repo = project.rsplit("/", 1)[-1]
-    return f"{repo}/{number}", (parsed.netloc.lower(), project, normalize_review_number(number))
-
-
 def extract_task_id(url: str) -> str | None:
-    parsed = parse_review_url(url)
-    return parsed[0] if parsed else None
-
-
-def resolve_task_reference(chat_id: int, task_ref: str) -> tuple[Task | None, str | None]:
-    """Find one task in this chat, or explain why the reference cannot be used."""
-    if LEGACY_REFERENCE_PATTERN.fullmatch(task_ref):
-        return None, f"Queue numbers such as <code>{html_escape(task_ref)}</code> are no longer supported. {REFERENCE_USAGE}"
-
-    tasks = db.get_tasks(chat_id)
-    if NUMBER_PATTERN.fullmatch(task_ref):
-        number = normalize_review_number(task_ref)
-        matches = [
-            task for task in tasks
-            if NUMBER_PATTERN.fullmatch(task.task_id.rsplit("/", 1)[-1])
-            and normalize_review_number(task.task_id.rsplit("/", 1)[-1]) == number
-        ]
-    elif QUALIFIED_REFERENCE_PATTERN.fullmatch(task_ref):
-        matches = [task for task in tasks if task.task_id == task_ref]
-    else:
-        parsed = parse_review_url(task_ref)
-        if parsed is None:
-            return None, f"Invalid PR/MR reference <code>{html_escape(task_ref)}</code>. {REFERENCE_USAGE}"
-        url_identity = parsed[1]
-        matches = [task for task in tasks if (saved := parse_review_url(task.url)) and saved[1] == url_identity]
-
-    if len(matches) == 1:
-        return matches[0], None
-    if len(matches) > 1:
-        alternatives = ", ".join(review_link(task.task_id, task.url) for task in matches)
-        return None, f"PR/MR number <code>{html_escape(task_ref)}</code> matches multiple reviews: {alternatives}. Use a qualified PR/MR reference."
-    return None, f"PR/MR reference <code>{html_escape(task_ref)}</code> not found in this chat. Use <code>!w</code> to see current references."
+    """Extract task ID from a GitLab MR or GitHub PR URL.
+    
+    Returns format: repo/N
+    """
+    # Try GitLab pattern
+    gitlab_match = GITLAB_MR_PATTERN.match(url)
+    if gitlab_match:
+        repo = gitlab_match.group(1)
+        mr_number = gitlab_match.group(2)
+        return f"{repo}/{mr_number}"
+    
+    # Try GitHub pattern
+    github_match = GITHUB_PR_PATTERN.match(url)
+    if github_match:
+        repo = github_match.group(1)
+        pr_number = github_match.group(2)
+        return f"{repo}/{pr_number}"
+    
+    return None
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -233,13 +187,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Check for !wdone command
     wdone_match = WDONE_PATTERN.match(text)
     if wdone_match:
-        task_ref = wdone_match.group(1).strip()
-        await handle_wdone(update, chat_id, task_ref)
+        task_id = wdone_match.group(1).strip()
+        await handle_wdone(update, chat_id, task_id)
         return
     elif WDONE_PREFIX.match(text):
         await update.message.reply_text(
-            "Usage: <code>!wdone &lt;PR/MR reference&gt;</code>\n"
-            "Examples: <code>!wdone repo/123</code>, <code>!wdone 123</code>, or <code>!wdone https://github.com/owner/repo/pull/123</code>",
+            "Usage: <code>!wdone &lt;N or task_id&gt;</code>\n"
+            "Examples: <code>!wdone 1</code>, <code>!wdone #1</code>, or <code>!wdone repo/123</code>",
             parse_mode=ParseMode.HTML
         )
         return
@@ -252,9 +206,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     elif WBOUNCE_PREFIX.match(text):
         await update.message.reply_text(
-            "Usage: <code>!wbounce &lt;PR/MR reference&gt;</code>\n"
+            "Usage: <code>!wbounce &lt;N or task_id&gt;</code>\n"
             "Remove a task with a Changes required comment.\n"
-            "Examples: <code>!wbounce repo/123</code>, <code>!wbounce 123</code>, or <code>!wbounce https://github.com/owner/repo/pull/123</code>",
+            "Examples: <code>!wbounce 1</code>, <code>!wbounce #1</code>, or <code>!wbounce repo/123</code>",
             parse_mode=ParseMode.HTML
         )
         return
@@ -295,17 +249,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await handle_wassign(update, chat_id, task_ref, assignees)
         return
     elif WASSIGN_PREFIX.match(text):
-        parts = text.split()
-        if len(parts) > 1 and LEGACY_REFERENCE_PATTERN.fullmatch(parts[1]):
-            _, error = resolve_task_reference(chat_id, parts[1])
-            await update.message.reply_text(error, parse_mode=ParseMode.HTML)
-            return
         await update.message.reply_text(
-            "Usage: <code>!wassign &lt;PR/MR reference&gt; @username [...]</code>\n"
+            "Usage: <code>!wassign &lt;N or task_id&gt; @username [...]</code>\n"
             "Examples:\n"
-            "• <code>!wassign repo/123 @alice</code>\n"
-            "• <code>!wassign 123 @alice @bob</code>\n"
-            "• <code>!wassign https://github.com/owner/repo/pull/123 @alice @bob @charlie</code>",
+            "• <code>!wassign 1 @alice</code>\n"
+            "• <code>!wassign #1 @alice @bob</code>\n"
+            "• <code>!wassign repo/123 @alice @bob @charlie</code>",
             parse_mode=ParseMode.HTML
         )
         return
@@ -324,14 +273,17 @@ async def handle_wadd(update: Update, chat_id: int, url: str, assignees: list[st
         )
         return
     
-    if db.add_task(chat_id, task_id, url, assignees, created_by) is None:
-        await update.message.reply_text(f"PR/MR reference {task_id} already exists in the queue.")
+    seq_num = db.add_task(chat_id, task_id, url, assignees, created_by)
+    
+    if seq_num is None:
+        await update.message.reply_text(f"Task {task_id} already exists in the queue.")
         return
     
-    response = review_link(task_id, url)
     if assignees:
         assignees_formatted = ", ".join(html_escape(a) for a in assignees)
-        response += f" → {assignees_formatted}"
+        response = f'[#{seq_num}] <a href="{html_escape(url)}">{html_escape(task_id)}</a> → {assignees_formatted}'
+    else:
+        response = f'[#{seq_num}] <a href="{html_escape(url)}">{html_escape(task_id)}</a>'
     await update.message.reply_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     
     assignees_log = ", ".join(assignees) if assignees else "unassigned"
@@ -346,12 +298,20 @@ async def handle_w(update: Update, chat_id: int) -> None:
         await update.message.reply_text("No tasks in the queue.")
         return
     
-    response = "\n".join(task_listing(task) for task in tasks)
+    lines = []
+    for t in tasks:
+        if t.assignees:
+            assignees_formatted = ", ".join(html_escape(a) for a in t.assignees)
+            lines.append(f'[#{t.seq_num}] <a href="{html_escape(t.url)}">{html_escape(t.task_id)}</a> → {assignees_formatted} (by {html_escape(t.created_by)})')
+        else:
+            lines.append(f'[#{t.seq_num}] <a href="{html_escape(t.url)}">{html_escape(t.task_id)}</a> (by {html_escape(t.created_by)})')
+    
+    response = "\n".join(lines)
     await update.message.reply_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
 async def handle_wdone(update: Update, chat_id: int, task_ref: str) -> None:
-    """Handle !wdone command - remove a task by PR/MR reference."""
+    """Handle !wdone command - remove a task by sequence number or task_id."""
     await handle_remove_task(update, chat_id, task_ref)
 
 
@@ -362,21 +322,24 @@ async def handle_wbounce(update: Update, chat_id: int, task_ref: str) -> None:
 
 async def handle_remove_task(update: Update, chat_id: int, task_ref: str, comment: Optional[str] = None) -> None:
     """Remove a task and reply with an optional comment."""
-    task, error = resolve_task_reference(chat_id, task_ref)
-    if error:
-        await update.message.reply_text(error, parse_mode=ParseMode.HTML)
-        return
-
-    removed_task = db.remove_task_by_id(chat_id, task.task_id)
+    # Strip # prefix if present
+    task_ref_clean = task_ref.lstrip('#')
+    
+    # Try to parse as sequence number first
+    if task_ref_clean.isdigit():
+        removed_task = db.remove_task_by_seq(chat_id, int(task_ref_clean))
+    else:
+        removed_task = db.remove_task_by_id(chat_id, task_ref)
+    
     if removed_task is None:
-        await update.message.reply_text(f"PR/MR reference <code>{html_escape(task_ref)}</code> not found in this chat.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"Task {task_ref} not found.")
         return
     
-    response = f'Removed {review_link(removed_task.task_id, removed_task.url)} (added by {html_escape(removed_task.created_by)})'
+    response = f'Removed [#{removed_task.seq_num}] <a href="{html_escape(removed_task.url)}">{html_escape(removed_task.task_id)}</a> (added by {html_escape(removed_task.created_by)})'
     if comment:
         response += f"\n{html_escape(comment)}"
     await update.message.reply_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    logger.info(f"Removed task {removed_task.task_id} from chat {chat_id}")
+    logger.info(f"Removed task #{removed_task.seq_num} ({removed_task.task_id}) from chat {chat_id}")
 
 
 async def handle_whelp(update: Update) -> None:
@@ -393,17 +356,17 @@ Examples:
 <code>!w</code>
 List all tasks in the queue
 
-<code>!wdone &lt;PR/MR reference&gt;</code>
-Remove a completed task by PR/MR reference, URL, or unambiguous PR/MR number
-Examples: <code>!wdone repo/123</code>, <code>!wdone 123</code>, or <code>!wdone https://github.com/owner/repo/pull/123</code>
+<code>!wdone &lt;N or task_id&gt;</code>
+Remove a completed task by number or ID
+Examples: <code>!wdone 1</code>, <code>!wdone #1</code>, or <code>!wdone repo/123</code>
 
-<code>!wbounce &lt;PR/MR reference&gt;</code>
+<code>!wbounce &lt;N or task_id&gt;</code>
 Remove a task with a Changes required comment
-Examples: <code>!wbounce repo/123</code>, <code>!wbounce 123</code>, or <code>!wbounce https://github.com/owner/repo/pull/123</code>
+Examples: <code>!wbounce 1</code>, <code>!wbounce #1</code>, or <code>!wbounce repo/123</code>
 
-<code>!wassign &lt;PR/MR reference&gt; @username [...]</code>
+<code>!wassign &lt;N or task_id&gt; @username [...]</code>
 Assign or reassign task (replaces all existing assignees)
-Examples: <code>!wassign repo/45 @alice</code>, <code>!wassign 45 @bob @charlie</code>, or <code>!wassign https://github.com/owner/repo/pull/45 @alice @bob</code>
+Examples: <code>!wassign 1 @alice</code>, <code>!wassign #2 @bob @charlie</code>, or <code>!wassign repo/45 @alice @bob</code>
 
 <code>!wreminder-set &lt;cron_expression&gt;</code>
 Set automatic reminder (5-part cron format, UTC time)
@@ -576,27 +539,29 @@ async def handle_wreminder_remove(update: Update, chat_id: int) -> None:
 
 async def handle_wassign(update: Update, chat_id: int, task_ref: str, assignees: list[str]) -> None:
     """Handle !wassign command - assign or reassign a task to one or more users."""
-    task, error = resolve_task_reference(chat_id, task_ref)
-    if error:
-        await update.message.reply_text(error, parse_mode=ParseMode.HTML)
-        return
-
-    updated_task = db.update_task_assignees_by_id(chat_id, task.task_id, assignees)
+    # Strip # prefix if present
+    task_ref_clean = task_ref.lstrip('#')
+    
+    # Try to parse as sequence number first
+    if task_ref_clean.isdigit():
+        updated_task = db.update_task_assignees_by_seq(chat_id, int(task_ref_clean), assignees)
+    else:
+        updated_task = db.update_task_assignees_by_id(chat_id, task_ref, assignees)
+    
     if updated_task is None:
-        await update.message.reply_text(f"PR/MR reference <code>{html_escape(task_ref)}</code> not found in this chat.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"Task {task_ref} not found.")
         return
     
-    response = review_link(updated_task.task_id, updated_task.url)
     if assignees:
         assignees_formatted = ", ".join(html_escape(a) for a in assignees)
-        response += f" → {assignees_formatted}"
+        response = f'[#{updated_task.seq_num}] <a href="{html_escape(updated_task.url)}">{html_escape(updated_task.task_id)}</a> → {assignees_formatted}'
     else:
-        response += " (unassigned)"
+        response = f'[#{updated_task.seq_num}] <a href="{html_escape(updated_task.url)}">{html_escape(updated_task.task_id)}</a> (unassigned)'
     
     await update.message.reply_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     
     assignees_log = ", ".join(assignees) if assignees else "unassigned"
-    logger.info(f"Assigned task {updated_task.task_id} to {assignees_log} in chat {chat_id}")
+    logger.info(f"Assigned task #{updated_task.seq_num} ({updated_task.task_id}) to {assignees_log} in chat {chat_id}")
 
 
 def main() -> None:
