@@ -1,6 +1,6 @@
 # Telegram Work Queue Bot
 
-A Telegram bot that manages task queues for GitLab/GitHub merge requests in channels/groups with automatic cron-based reminders.
+A Telegram bot that manages task queues for GitLab/GitHub merge requests in channels/groups with automatic cron-based reminders and weekly contributor and reviewer leaderboards.
 
 ## Commands
 
@@ -23,6 +23,28 @@ A Telegram bot that manages task queues for GitLab/GitHub merge requests in chan
 | `!wreminder` | Show current reminder configuration |
 | `!wreminder-off` | Disable reminder (keeps configuration) |
 | `!wreminder-remove` | Delete reminder configuration |
+
+### Leaderboards
+
+| Command | Description |
+|---------|-------------|
+| `!wleaderboard` | Show this week's contributor and reviewer standings |
+| `!wleaderboard last` | Show the previous Monday–Sunday |
+| `!wleaderboard-off` | Disable automatic weekly recaps; keep tracking activity |
+| `!wleaderboard-on` | Enable recaps starting with the next scheduled delivery |
+
+Each chat has separate rankings. Both show the top five people, counts, date range, and **Asia/Tashkent** timezone, ordered by count descending and then name alphabetically. On-demand standings include empty states.
+
+| Action | Contributor credit | Reviewer credit |
+|--------|--------------------|-----------------|
+| `!wdone` | The person who submitted the queue entry | The command sender, unless also the submitter |
+| `!wbounce` | None | The command sender, unless also the submitter |
+
+Each person earns at most **one point per PR/MR per ranking per week**, including when a review is re-added or bounced multiple times. Different reviewers can each earn a point for the same PR/MR. Assignees do not receive credit automatically. Points belong to the completion week, regardless of when the review was submitted. PR/MR identities use the URL's host, full project path, and normalized number, ignoring scheme, query, fragment, and trailing slashes.
+
+Automatic recaps run every **Monday at 09:00 Asia/Tashkent**, covering the previous Monday–Sunday. Existing chats are enrolled during migration; new chats are enrolled on their first successful submission. Any chat member can toggle recaps, and an opt-out persists across submissions and restarts. Recaps are skipped if both rankings are empty. After a restart, the bot attempts only the most recent overdue recap that was enabled when due; successful deliveries are saved to prevent duplicates. Re-enabling does not send an overdue recap immediately.
+
+Telegram user IDs keep credit together when a username changes. Existing queue entries retain their saved submitter names; legacy names match known IDs only when unambiguous. Otherwise credit stays under the legacy name. Unknown or anonymous senders receive no individual entry. History starts at rollout, including later completions of currently queued reviews; previously deleted reviews cannot be reconstructed. Scoring reflects bot commands and identifies the queue submitter as the contributor.
 
 ## PR/MR References
 
@@ -228,6 +250,7 @@ Reminders use 5-part cron expressions in UTC timezone:
 - **Unique Tasks**: PR/MR references are unique per channel (the same MR can't be added twice)
 - **Clickable Links**: Tasks are displayed as clickable links to the MR/PR
 - **Custom Reminders**: Each channel can configure its own reminder schedule
+- **Weekly Leaderboards**: Separate contributor and reviewer rankings and Monday recaps for each chat
 - **Persistent Storage**: Data is stored in SQLite database (`workqueue.db`)
 - **Flexible Assignment**: Reassign tasks at any time, replacing all existing assignees
 
@@ -236,3 +259,4 @@ Reminders use 5-part cron expressions in UTC timezone:
 - **Task Assignment**: Use `!wassign` to change assignees - this replaces all existing assignees with the new ones
 - **Task Removal**: When a task is removed, all its assignees are automatically cleaned up
 - **Migration**: Existing single-assignee tasks are automatically migrated to support multiple assignees on first run
+- **Completion History**: Review outcomes and identities are archived in the same transaction that removes a review and its assignees

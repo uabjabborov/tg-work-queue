@@ -2,7 +2,6 @@ import os
 import re
 import logging
 from typing import Optional
-from urllib.parse import urlsplit
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
@@ -10,7 +9,9 @@ from telegram.constants import ParseMode
 from html import escape as html_escape
 
 from database import Database, Task
+from leaderboard import build_leaderboard, format_leaderboard, reporting_week
 from presentation import review_link, task_listing
+from review_urls import normalize_review_number, parse_review_url
 from scheduler import add_reminder_job, remove_reminder_job, setup_scheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -43,9 +44,11 @@ WREMINDER_OFF_PATTERN = re.compile(r"^!wreminder-off$", re.IGNORECASE)
 WREMINDER_REMOVE_PATTERN = re.compile(r"^!wreminder-remove$", re.IGNORECASE)
 WASSIGN_PATTERN = re.compile(r"^!wassign\s+(.+?)\s+((?:@\w+\s*)+)$", re.IGNORECASE)
 WASSIGN_PREFIX = re.compile(r"^!wassign\b", re.IGNORECASE)
+WLEADERBOARD_PATTERN = re.compile(r"^!wleaderboard(?:\s+(last))?$", re.IGNORECASE)
+WLEADERBOARD_OFF_PATTERN = re.compile(r"^!wleaderboard-off$", re.IGNORECASE)
+WLEADERBOARD_ON_PATTERN = re.compile(r"^!wleaderboard-on$", re.IGNORECASE)
+WLEADERBOARD_PREFIX = re.compile(r"^!wleaderboard\b", re.IGNORECASE)
 
-GITLAB_MR_PATH_PATTERN = re.compile(r"(?P<project>/(?:[^/]+/)*[^/]+)/-/merge_requests/(?P<number>[0-9]+)")
-GITHUB_PR_PATH_PATTERN = re.compile(r"(?P<project>/[^/]+/[^/]+)/pull/(?P<number>[0-9]+)")
 QUALIFIED_REFERENCE_PATTERN = re.compile(r"[^/\s]+/[0-9]+")
 NUMBER_PATTERN = re.compile(r"[0-9]+")
 LEGACY_REFERENCE_PATTERN = re.compile(r"#[0-9]+")
@@ -130,35 +133,6 @@ def validate_wadd_args(text: str) -> str:
     )
 
 
-def normalize_review_number(number: str) -> str:
-    return number.lstrip("0") or "0"
-
-
-def parse_review_url(url: str) -> tuple[str, tuple[str, str, str]] | None:
-    """Return the display reference and URL identity for a PR/MR link."""
-    try:
-        parsed = urlsplit(url)
-        hostname = parsed.hostname
-        parsed.port
-    except ValueError:
-        return None
-    if parsed.scheme.lower() not in ("http", "https") or not hostname or parsed.username is not None:
-        return None
-
-    path = parsed.path.rstrip("/")
-    if hostname.lower() == "github.com":
-        match = GITHUB_PR_PATH_PATTERN.fullmatch(path)
-    else:
-        match = GITLAB_MR_PATH_PATTERN.fullmatch(path)
-    if match is None:
-        return None
-
-    project = match.group("project")
-    number = match.group("number")
-    repo = project.rsplit("/", 1)[-1]
-    return f"{repo}/{number}", (parsed.netloc.lower(), project, normalize_review_number(number))
-
-
 def extract_task_id(url: str) -> str | None:
     parsed = parse_review_url(url)
     return parsed[0] if parsed else None
@@ -194,6 +168,15 @@ def resolve_task_reference(chat_id: int, task_ref: str) -> tuple[Task | None, st
     return None, f"PR/MR reference <code>{html_escape(task_ref)}</code> not found in this chat. Use <code>!w</code> to see current references."
 
 
+def sender_identity(update: Update) -> tuple[int | None, str]:
+    """Anonymous chat senders and Telegram's placeholder bot are not individuals."""
+    user = update.effective_user
+    if not user or getattr(update.message, "sender_chat", None) or getattr(user, "is_bot", False):
+        return None, "Unknown"
+    name = f"@{user.username}" if user.username else user.first_name
+    return getattr(user, "id", None), name or "Unknown"
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle incoming messages and route to appropriate command handlers."""
     if not update.message or not update.message.text:
@@ -202,9 +185,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text = update.message.text.strip()
     chat_id = update.effective_chat.id
     
-    # Get the username of the message author
-    user = update.effective_user
-    created_by = f"@{user.username}" if user and user.username else user.first_name if user else "Unknown"
+    created_by_id, created_by = sender_identity(update)
     
     # Check for !wadd command
     wadd_match_with_user = WADD_PATTERN_WITH_USER.match(text)
@@ -214,11 +195,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         url = wadd_match_with_user.group(1)
         assignees_str = wadd_match_with_user.group(2)
         assignees = parse_assignees(assignees_str)
-        await handle_wadd(update, chat_id, url, assignees, created_by)
+        await handle_wadd(update, chat_id, url, assignees, created_by, created_by_id)
         return
     elif wadd_match_no_user:
         url = wadd_match_no_user.group(1)
-        await handle_wadd(update, chat_id, url, [], created_by)
+        await handle_wadd(update, chat_id, url, [], created_by, created_by_id)
         return
     elif WADD_PREFIX.match(text):
         error_msg = validate_wadd_args(text)
@@ -262,6 +243,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Check for !whelp command
     if WHELP_PATTERN.match(text):
         await handle_whelp(update)
+        return
+
+    if WLEADERBOARD_OFF_PATTERN.match(text):
+        await handle_wleaderboard_toggle(update, chat_id, enabled=False)
+        return
+    if WLEADERBOARD_ON_PATTERN.match(text):
+        await handle_wleaderboard_toggle(update, chat_id, enabled=True)
+        return
+    leaderboard_match = WLEADERBOARD_PATTERN.match(text)
+    if leaderboard_match:
+        await handle_wleaderboard(update, chat_id, previous=bool(leaderboard_match.group(1)))
+        return
+    if WLEADERBOARD_PREFIX.match(text):
+        await update.message.reply_text(
+            "Usage: <code>!wleaderboard</code> for this week or <code>!wleaderboard last</code> for last week.\n"
+            "Use <code>!wleaderboard-off</code> / <code>!wleaderboard-on</code> to toggle automatic recaps.",
+            parse_mode=ParseMode.HTML
+        )
         return
     
     # Check for !wreminder command
@@ -311,7 +310,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
 
-async def handle_wadd(update: Update, chat_id: int, url: str, assignees: list[str], created_by: str) -> None:
+async def handle_wadd(update: Update, chat_id: int, url: str, assignees: list[str], created_by: str,
+                      created_by_id: int | None = None) -> None:
     """Handle !wadd command - add a new task from MR/PR link."""
     task_id = extract_task_id(url)
     
@@ -324,7 +324,7 @@ async def handle_wadd(update: Update, chat_id: int, url: str, assignees: list[st
         )
         return
     
-    if db.add_task(chat_id, task_id, url, assignees, created_by) is None:
+    if db.add_task(chat_id, task_id, url, assignees, created_by, created_by_id) is None:
         await update.message.reply_text(f"PR/MR reference {task_id} already exists in the queue.")
         return
     
@@ -352,22 +352,29 @@ async def handle_w(update: Update, chat_id: int) -> None:
 
 async def handle_wdone(update: Update, chat_id: int, task_ref: str) -> None:
     """Handle !wdone command - remove a task by PR/MR reference."""
-    await handle_remove_task(update, chat_id, task_ref)
+    await handle_remove_task(update, chat_id, task_ref, outcome="done")
 
 
 async def handle_wbounce(update: Update, chat_id: int, task_ref: str) -> None:
     """Handle !wbounce command - remove a task that requires changes."""
-    await handle_remove_task(update, chat_id, task_ref, comment="Changes required.")
+    await handle_remove_task(update, chat_id, task_ref, outcome="bounce", comment="Changes required.")
 
 
-async def handle_remove_task(update: Update, chat_id: int, task_ref: str, comment: Optional[str] = None) -> None:
+async def handle_remove_task(update: Update, chat_id: int, task_ref: str, outcome: str,
+                              comment: Optional[str] = None) -> None:
     """Remove a task and reply with an optional comment."""
     task, error = resolve_task_reference(chat_id, task_ref)
     if error:
         await update.message.reply_text(error, parse_mode=ParseMode.HTML)
         return
 
-    removed_task = db.remove_task_by_id(chat_id, task.task_id)
+    completed_by_id, completed_by = sender_identity(update)
+    try:
+        removed_task = db.complete_task(chat_id, task.id, outcome, completed_by, completed_by_id)
+    except Exception:
+        logger.exception("Could not complete review %s in chat %s", task.task_id, chat_id)
+        await update.message.reply_text("Could not remove the review. Please try again later.")
+        return
     if removed_task is None:
         await update.message.reply_text(f"PR/MR reference <code>{html_escape(task_ref)}</code> not found in this chat.", parse_mode=ParseMode.HTML)
         return
@@ -377,6 +384,20 @@ async def handle_remove_task(update: Update, chat_id: int, task_ref: str, commen
         response += f"\n{html_escape(comment)}"
     await update.message.reply_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     logger.info(f"Removed task {removed_task.task_id} from chat {chat_id}")
+
+
+async def handle_wleaderboard(update: Update, chat_id: int, previous: bool = False) -> None:
+    board = build_leaderboard(db, chat_id, reporting_week(previous=previous))
+    await update.message.reply_text(format_leaderboard(board), parse_mode=ParseMode.HTML)
+
+
+async def handle_wleaderboard_toggle(update: Update, chat_id: int, enabled: bool) -> None:
+    db.set_leaderboard_enabled(chat_id, enabled)
+    response = (
+        "Weekly recaps enabled for the next scheduled recap: Monday at 09:00 Asia/Tashkent."
+        if enabled else "Weekly recaps disabled. Activity tracking continues."
+    )
+    await update.message.reply_text(response)
 
 
 async def handle_whelp(update: Update) -> None:
@@ -419,6 +440,19 @@ Disable reminder (keeps configuration)
 
 <code>!wreminder-remove</code>
 Delete reminder configuration
+
+<code>!wleaderboard</code> / <code>!wleaderboard last</code>
+Show this week's or last week's top five contributors and reviewers (Asia/Tashkent)
+
+<code>!wleaderboard-off</code> / <code>!wleaderboard-on</code>
+Disable or enable automatic recaps; any chat member can toggle them. Tracking continues.
+Recaps: Monday at 09:00 Asia/Tashkent, covering the previous Monday–Sunday.
+
+<b>Leaderboard scoring:</b>
+• !wdone: contributor point for the queue submitter; reviewer point for the command sender
+• !wbounce: reviewer point for the command sender; no contributor point
+• Self-reviews earn no reviewer points. Assignees do not receive points automatically.
+• Each person earns at most one point per PR/MR per ranking per completion week, even if re-added.
 
 <code>!whelp</code>
 Show this help message
@@ -599,6 +633,17 @@ async def handle_wassign(update: Update, chat_id: int, task_ref: str, assignees:
     logger.info(f"Assigned task {updated_task.task_id} to {assignees_log} in chat {chat_id}")
 
 
+async def post_init(application: Application) -> None:
+    """Start jobs and catch up recaps after the Telegram client is initialized."""
+    application.bot_data["scheduler"] = await setup_scheduler(application, db)
+
+
+async def post_stop(application: Application) -> None:
+    scheduler = application.bot_data.get("scheduler")
+    if scheduler and scheduler.running:
+        scheduler.shutdown(wait=False)
+
+
 def main() -> None:
     """Start the bot."""
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -608,16 +653,12 @@ def main() -> None:
         raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
     
     # Create application
-    application = Application.builder().token(token).build()
+    application = Application.builder().token(token).post_init(post_init).post_stop(post_stop).build()
     
     # Add message handler for all text messages
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
-    
-    # Setup and start the reminder scheduler
-    setup_scheduler(application, db)
-    logger.info("Reminder scheduler initialized")
     
     # Start polling
     logger.info("Starting bot...")

@@ -1,9 +1,11 @@
 import logging
+from datetime import datetime
 from typing import TYPE_CHECKING
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from telegram.constants import ParseMode
 from presentation import task_listing
+from leaderboard import TASHKENT, build_leaderboard, format_leaderboard, most_recent_recap
 
 if TYPE_CHECKING:
     from telegram.ext import Application
@@ -125,16 +127,62 @@ def load_existing_reminders(application: "Application", db: "Database") -> None:
     logger.info(f"Loaded {len(reminders)} active reminder(s)")
 
 
-def setup_scheduler(application: "Application", db: "Database") -> AsyncIOScheduler:
-    """Initialize and start the scheduler with existing reminders."""
+async def send_weekly_leaderboards(application: "Application", db: "Database",
+                                   now: datetime | None = None) -> None:
+    """Deliver the most recent overdue recap to eligible chats, once per reporting week."""
+    week, due = most_recent_recap(now)
+    for settings in db.get_active_leaderboard_settings():
+        chat_id = settings.chat_id
+        try:
+            # Recheck after other chats' sends, which may have yielded to a toggle command.
+            current = db.get_leaderboard_settings(chat_id)
+            if not current or not current.enabled or current.enabled_since >= due:
+                continue
+            if db.has_leaderboard_delivery(chat_id, week.start.date()):
+                continue
+            board = build_leaderboard(db, chat_id, week)
+            if board.empty:
+                logger.info("No leaderboard activity for chat %s, skipping weekly recap", chat_id)
+                continue
+            await application.bot.send_message(
+                chat_id=chat_id,
+                text=format_leaderboard(board),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True
+            )
+            db.record_leaderboard_delivery(chat_id, week.start.date(), now)
+            logger.info("Sent weekly leaderboard to chat %s for %s", chat_id, week.start.date())
+        except Exception:
+            logger.exception("Error sending weekly leaderboard to chat %s", chat_id)
+
+
+async def setup_scheduler(application: "Application", db: "Database") -> AsyncIOScheduler:
+    """Start jobs and catch up recaps using an initialized Telegram client."""
     scheduler = get_scheduler()
     
     # Load existing reminders from database
     load_existing_reminders(application, db)
-    
-    # Start the scheduler if not already running
-    if not scheduler.running:
-        scheduler.start()
-        logger.info("Scheduler started")
-    
+    scheduler.add_job(
+        send_weekly_leaderboards,
+        trigger=CronTrigger(day_of_week="mon", hour=9, minute=0, second=0, timezone=TASHKENT),
+        args=[application, db],
+        id="weekly_leaderboards",
+        name="Weekly contributor and reviewer leaderboards",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=None
+    )
+    # Pause new jobs while catching up, so a due job cannot overlap the startup send.
+    # A Monday deadline crossed during catch-up runs after resume, using delivery records.
+    starting = not scheduler.running
+    if starting:
+        scheduler.start(paused=True)
+    try:
+        await send_weekly_leaderboards(application, db)
+    finally:
+        if starting:
+            scheduler.resume()
+            logger.info("Scheduler started")
+
     return scheduler
