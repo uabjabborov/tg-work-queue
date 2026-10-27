@@ -55,10 +55,8 @@ def split_messages(blocks: list[str], separator: str = "\n") -> list[str]:
     return messages
 
 
-def assigned_reviews(tasks: list["Task"]) -> list[str]:
-    """List one person's reviews with collapsed description previews, split to fit Telegram."""
-    if not tasks:
-        return ["No reviews are assigned to you."]
+def detailed_reviews(header: str, tasks: list["Task"]) -> list[str]:
+    """List reviews with collapsed description previews, split to fit Telegram."""
     entries = [
         task_listing(task) + (
             f"\n<blockquote expandable>{html_escape(shorten(task.description, DESCRIPTION_PREVIEW_LIMIT))}</blockquote>"
@@ -66,4 +64,10 @@ def assigned_reviews(tasks: list["Task"]) -> list[str]:
         )
         for task in tasks
     ]
-    return split_messages([f"<b>Assigned to you ({len(tasks)})</b>"] + entries, separator="\n\n")
+    return split_messages([f"<b>{html_escape(header)} ({len(tasks)})</b>"] + entries, separator="\n\n")
+
+
+def assigned_reviews(tasks: list["Task"]) -> list[str]:
+    if not tasks:
+        return ["No reviews are assigned to you."]
+    return detailed_reviews("Assigned to you", tasks)

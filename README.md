@@ -11,6 +11,7 @@ A Telegram bot that manages task queues for GitLab/GitHub merge requests in chan
 | `!wadd <MR/PR URL> [@username ...]` | Add a merge request (optionally assign to one or more users) |
 | `!w` | List all tasks in the queue |
 | `!wme` | Privately show reviews assigned to you, with descriptions |
+| `!wdetails` | Privately show every review in the queue, with titles and descriptions |
 | `!wdone <PR/MR reference>` | Remove a completed review |
 | `!wbounce <PR/MR reference>` | Remove a review with a "Changes required" comment in the chat |
 | `!wassign <PR/MR reference> @username [...]` | Assign or reassign a review (replaces all existing assignees) |
@@ -344,7 +345,7 @@ Reminders use 5-part cron expressions in UTC timezone:
 - **Persistent Storage**: Data is stored in SQLite database (`workqueue.db`)
 - **Flexible Assignment**: Reassign tasks at any time, replacing all existing assignees
 
-## Private Replies (`!wme`)
+## Private Replies (`!wme`, `!wdetails`)
 
 `!wme` lists the reviews in the current chat whose assignees include your `@username`, with fresh titles and a collapsed description preview. Long lists are split across several messages.
 
@@ -352,6 +353,8 @@ Reminders use 5-part cron expressions in UTC timezone:
 - The bot must be a group **admin** to send ephemeral messages. Otherwise it replies with a short notice instead of posting your list publicly. If Telegram ever posts the reply publicly (for example, a self-hosted Bot API server without ephemeral support), the bot deletes it immediately.
 - Your `!wme` message itself stays visible to the group; only the reply is private.
 - In a direct message with the bot, `!wme` lists your reviews from all groups as a normal reply.
+
+`!wdetails` works the same way but lists every review in the chat's queue, not just yours. It only works in groups, so the queue isn't shown to people outside the group.
 
 ## PR/MR Titles
 

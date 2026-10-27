@@ -12,7 +12,9 @@ from html import escape as html_escape
 
 from database import Database, Task
 from leaderboard import build_leaderboard, format_leaderboard, reporting_week
-from presentation import assigned_reviews, review_heading, review_link, split_messages, task_listing
+from presentation import (
+    assigned_reviews, detailed_reviews, review_heading, review_link, split_messages, task_listing,
+)
 from review_details import fetch_review_details, review_client
 from review_urls import normalize_review_number, parse_review_url
 from scheduler import add_reminder_job, remove_reminder_job, setup_scheduler
@@ -37,6 +39,7 @@ WADD_PATTERN_NO_USER = re.compile(r"^!wadd\s+(https?://\S+)$", re.IGNORECASE)
 WADD_PREFIX = re.compile(r"^!wadd\b", re.IGNORECASE)
 W_PATTERN = re.compile(r"^!w$", re.IGNORECASE)
 WME_PATTERN = re.compile(r"^!wme$", re.IGNORECASE)
+WDETAILS_PATTERN = re.compile(r"^!wdetails$", re.IGNORECASE)
 WDONE_PATTERN = re.compile(r"^!wdone\s+(.+)$", re.IGNORECASE)
 WDONE_PREFIX = re.compile(r"^!wdone\b", re.IGNORECASE)
 WBOUNCE_PATTERN = re.compile(r"^!wbounce\s+(.+)$", re.IGNORECASE)
@@ -219,6 +222,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if WME_PATTERN.match(text):
         await handle_wme(update, context, chat_id)
         return
+
+    if WDETAILS_PATTERN.match(text):
+        await handle_wdetails(update, context, chat_id)
+        return
     
     # Check for !wdone command
     wdone_match = WDONE_PATTERN.match(text)
@@ -376,12 +383,19 @@ async def handle_w(update: Update, chat_id: int) -> None:
         await update.message.reply_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
+async def reject_anonymous_sender(update: Update, command: str) -> bool:
+    """Private replies go to one user, so they need an identified sender."""
+    user_id, _ = sender_identity(update)
+    if user_id is not None:
+        return False
+    await update.message.reply_text(f"<code>{command}</code> needs to know who you are. Send it from your own account, not anonymously.",
+                                    parse_mode=ParseMode.HTML)
+    return True
+
+
 async def handle_wme(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
     """Handle !wme command - privately show reviews assigned to the sender."""
-    user_id, _ = sender_identity(update)
-    if user_id is None:
-        await update.message.reply_text("<code>!wme</code> needs to know who you are. Send it from your own account, not anonymously.",
-                                        parse_mode=ParseMode.HTML)
+    if await reject_anonymous_sender(update, "!wme"):
         return
 
     username = update.effective_user.username
@@ -395,6 +409,25 @@ async def handle_wme(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id
     # Fetch fresh titles and descriptions; the list is short and only the requester sees it.
     await refresh_task_details(tasks)
     await reply_privately(update, context, assigned_reviews(tasks))
+
+
+async def handle_wdetails(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """Handle !wdetails command - privately show every queued review with its description."""
+    if await reject_anonymous_sender(update, "!wdetails"):
+        return
+    if update.effective_chat.type == ChatType.PRIVATE:
+        # Listing every group's queue here would show it to anyone who messages the bot.
+        await update.message.reply_text("Send <code>!wdetails</code> in a group to see its queue.",
+                                        parse_mode=ParseMode.HTML)
+        return
+
+    tasks = db.get_tasks(chat_id)
+    if not tasks:
+        await reply_privately(update, context, ["No tasks in the queue."])
+        return
+    # Only fill in missing details: refreshing a whole queue on every call would use up GitHub's rate limit.
+    await refresh_task_details([task for task in tasks if not task.title])
+    await reply_privately(update, context, detailed_reviews("Review queue", tasks))
 
 
 async def refresh_task_details(tasks: list[Task]) -> None:
@@ -447,7 +480,7 @@ async def reply_privately(update: Update, context: ContextTypes.DEFAULT_TYPE, te
 async def private_reply_failure(context: ContextTypes.DEFAULT_TYPE, chat_id: int, error: TelegramError) -> str:
     """Explain a failed ephemeral reply without blaming admin rights unless they are the cause."""
     if isinstance(error, TimedOut):
-        return "Telegram didn't confirm my private reply. If you didn't get it, send <code>!wme</code> again."
+        return "Telegram didn't confirm my private reply. If you didn't get it, send the command again."
     if isinstance(error, (BadRequest, Forbidden)):
         try:
             member = await context.bot.get_chat_member(chat_id, context.bot.id)
@@ -455,7 +488,7 @@ async def private_reply_failure(context: ContextTypes.DEFAULT_TYPE, chat_id: int
             member = None
         if member is not None and member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
             return "I couldn't reply privately. Make me a group admin so I can send replies only you can see."
-    return "I couldn't reply privately right now. Please try <code>!wme</code> again later."
+    return "I couldn't reply privately right now. Please try again later."
 
 
 async def handle_wdone(update: Update, chat_id: int, task_ref: str) -> None:
@@ -524,6 +557,9 @@ List all tasks in the queue
 
 <code>!wme</code>
 Privately show reviews assigned to you, with descriptions. Only you see the reply. In a direct message with the bot, lists your reviews from all groups.
+
+<code>!wdetails</code>
+Privately show every review in the queue with its title and description. Only you see the reply.
 
 <code>!wdone &lt;PR/MR reference&gt;</code>
 Remove a completed task by PR/MR reference, URL, or unambiguous PR/MR number

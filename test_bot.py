@@ -415,9 +415,9 @@ class ReviewDetailsCommandTests(unittest.IsolatedAsyncioTestCase):
         cases = (
             (BadRequest("Not enough rights"), "member", "Make me a group admin"),
             (Forbidden("Forbidden"), "left", "Make me a group admin"),
-            (BadRequest("Can't parse entities"), "administrator", "try <code>!wme</code> again later"),
+            (BadRequest("Can't parse entities"), "administrator", "try again later"),
             (TimedOut(), "administrator", "didn't confirm"),
-            (RetryAfter(5), "administrator", "try <code>!wme</code> again later"),
+            (RetryAfter(5), "administrator", "try again later"),
         )
         for error, status, expected in cases:
             with self.subTest(error=error, status=status):
@@ -427,11 +427,49 @@ class ReviewDetailsCommandTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(expected, reply)
                 self.assertNotIn("Secret plan", reply)
 
-    async def test_wme_rejects_anonymous_admins(self):
-        anonymous = self.make_update("!wme", anonymous=True)
-        telegram_bot = await self.send(anonymous)
+    async def test_private_commands_reject_anonymous_admins(self):
+        for command in ("!wme", "!wdetails"):
+            with self.subTest(command=command):
+                anonymous = self.make_update(command, anonymous=True)
+                telegram_bot = await self.send(anonymous)
+                telegram_bot.send_message.assert_not_awaited()
+                self.assertIn("anonymously", anonymous.message.reply_text.await_args.args[0])
+
+    async def test_wdetails_privately_lists_the_whole_queue_with_descriptions(self):
+        first = self.add_task(1, ["@bob"], title="Saved title", description="First <body>")
+        second = self.add_task(2, [])
+        self.add_task(3, ["@alice"], chat_id=2, title="Other chat")
+        self.details[first] = ReviewDetails("Should not refetch", "")
+        self.details[second] = ReviewDetails("Fetched title", "Second body")
+        update = self.make_update("!wdetails")
+
+        telegram_bot = await self.send(update)
+
+        self.assertEqual([call.args[1] for call in self.fetch_details.await_args_list], [second])
+        telegram_bot.send_message.assert_awaited_once()
+        args, kwargs = telegram_bot.send_message.await_args
+        self.assertEqual(kwargs["api_kwargs"], {"ephemeral_message_parameters": {"receiver_user_id": 7}})
+        self.assertEqual(args[1], (
+            "<b>Review queue (2)</b>\n\n"
+            f'<a href="{first}">repo/1</a> — Saved title → @bob (by @author)\n'
+            "<blockquote expandable>First &lt;body&gt;</blockquote>\n\n"
+            f'<a href="{second}">repo/2</a> — Fetched title (by @author)\n'
+            "<blockquote expandable>Second body</blockquote>"
+        ))
+        update.message.reply_text.assert_not_awaited()
+
+    async def test_wdetails_empty_queue_and_private_chat(self):
+        update = self.make_update("!wdetails")
+        telegram_bot = await self.send(update)
+        self.assertEqual(telegram_bot.send_message.await_args.args[1], "No tasks in the queue.")
+
+        self.add_task(1, ["@alice"], chat_id=-100, title="Group secret")
+        private = self.make_update("!wdetails", chat_type="private", chat_id=7)
+        telegram_bot = await self.send(private)
         telegram_bot.send_message.assert_not_awaited()
-        self.assertIn("anonymously", anonymous.message.reply_text.await_args.args[0])
+        reply = private.message.reply_text.await_args.args[0]
+        self.assertIn("in a group", reply)
+        self.assertNotIn("Group secret", reply)
 
     def test_visible_length_ignores_markup_and_counts_like_telegram(self):
         self.assertEqual(visible_length('<a href="https://example.com/very/long">repo/1</a> &lt;b&gt;'), 10)
