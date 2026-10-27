@@ -2,10 +2,11 @@ import asyncio
 import os
 import re
 import logging
-from typing import Optional
+from collections import Counter
+from typing import Any, Awaitable, Optional
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import Application, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, BaseUpdateProcessor, MessageHandler, ContextTypes, filters
 from telegram.constants import ChatMemberStatus, ChatType, ParseMode
 from telegram.error import BadRequest, Forbidden, TelegramError, TimedOut
 from html import escape as html_escape
@@ -15,7 +16,7 @@ from leaderboard import build_leaderboard, format_leaderboard, reporting_week
 from presentation import (
     assigned_reviews, detailed_reviews, review_heading, review_link, split_messages, task_listing,
 )
-from review_details import fetch_review_details, review_client
+from review_details import chat_may_use_tokens, fetch_review_details, review_client
 from review_urls import normalize_review_number, parse_review_url
 from scheduler import add_reminder_job, remove_reminder_job, setup_scheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -60,6 +61,10 @@ WLEADERBOARD_PREFIX = re.compile(r"^!wleaderboard\b", re.IGNORECASE)
 QUALIFIED_REFERENCE_PATTERN = re.compile(r"[^/\s]+/[0-9]+")
 NUMBER_PATTERN = re.compile(r"[0-9]+")
 LEGACY_REFERENCE_PATTERN = re.compile(r"#[0-9]+")
+
+# Concurrent lookups per refresh, to stay polite to GitHub and GitLab.
+LOOKUP_CONCURRENCY = 5
+MEMBER_STATUSES = (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER)
 
 REFERENCE_USAGE = "Use a PR/MR reference such as <code>repo/120</code>, its URL, or an unambiguous PR/MR number. Use <code>!w</code> to see current references."
 
@@ -347,17 +352,19 @@ async def handle_wadd(update: Update, chat_id: int, url: str, assignees: list[st
         )
         return
     
+    already_queued = f"PR/MR reference {task_id} already exists in the queue."
+    # Checked before the lookup only to avoid a wasted request; add_task still enforces uniqueness.
     if db.has_task(chat_id, task_id):
-        await update.message.reply_text(f"PR/MR reference {task_id} already exists in the queue.")
+        await update.message.reply_text(already_queued)
         return
 
     async with review_client() as client:
-        details = await fetch_review_details(client, url)
+        details = await fetch_review_details(client, url, use_tokens=chat_may_use_tokens(chat_id))
     title = details.title if details else None
     description = details.description if details else None
     if db.add_task(chat_id, task_id, url, assignees, created_by, created_by_id,
                    title=title, description=description) is None:
-        await update.message.reply_text(f"PR/MR reference {task_id} already exists in the queue.")
+        await update.message.reply_text(already_queued)
         return
     
     response = review_heading(task_id, url, title)
@@ -378,7 +385,7 @@ async def handle_w(update: Update, chat_id: int) -> None:
         await update.message.reply_text("No tasks in the queue.")
         return
     
-    await refresh_task_details([task for task in tasks if not task.title])
+    await backfill_missing_details(tasks)
     for response in split_messages([task_listing(task) for task in tasks]):
         await update.message.reply_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
@@ -403,9 +410,13 @@ async def handle_wme(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id
         await reply_privately(update, context, ["Set a Telegram username to use <code>!wme</code>. Reviews are assigned by @username."])
         return
 
-    # A direct message has no queue of its own, so list assignments from every group.
-    in_private_chat = update.effective_chat.type == ChatType.PRIVATE
-    tasks = db.get_tasks_assigned_to(f"@{username}", None if in_private_chat else chat_id)
+    # A direct message has no queue of its own, so list assignments from every group the
+    # sender is still in. A matching @username alone could be a typo or a reclaimed name.
+    if update.effective_chat.type == ChatType.PRIVATE:
+        tasks = await tasks_in_member_groups(context, db.get_tasks_assigned_to(f"@{username}"),
+                                             update.effective_user.id)
+    else:
+        tasks = db.get_tasks_assigned_to(f"@{username}", chat_id)
     # Fetch fresh titles and descriptions; the list is short and only the requester sees it.
     await refresh_task_details(tasks)
     await reply_privately(update, context, assigned_reviews(tasks))
@@ -426,20 +437,48 @@ async def handle_wdetails(update: Update, context: ContextTypes.DEFAULT_TYPE, ch
         await reply_privately(update, context, ["No tasks in the queue."])
         return
     # Only fill in missing details: refreshing a whole queue on every call would use up GitHub's rate limit.
-    await refresh_task_details([task for task in tasks if not task.title])
+    await backfill_missing_details(tasks)
     await reply_privately(update, context, detailed_reviews("Review queue", tasks))
+
+
+async def tasks_in_member_groups(context: ContextTypes.DEFAULT_TYPE, tasks: list[Task], user_id: int) -> list[Task]:
+    """Keep only tasks from chats the user currently belongs to."""
+    async def is_member(chat_id: int) -> bool:
+        try:
+            member = await context.bot.get_chat_member(chat_id, user_id)
+        except TelegramError:
+            return False
+        return member.status in MEMBER_STATUSES or (
+            member.status == ChatMemberStatus.RESTRICTED and getattr(member, "is_member", False)
+        )
+
+    chat_ids = list(dict.fromkeys(task.chat_id for task in tasks))
+    memberships = dict(zip(chat_ids, await asyncio.gather(*(is_member(chat_id) for chat_id in chat_ids))))
+    return [task for task in tasks if memberships[task.chat_id]]
+
+
+async def backfill_missing_details(tasks: list[Task]) -> None:
+    await refresh_task_details([task for task in tasks if not task.title])
 
 
 async def refresh_task_details(tasks: list[Task]) -> None:
     """Fetch PR/MR titles and descriptions, keeping saved values when a fetch fails."""
     if not tasks:
         return
+    limit = asyncio.Semaphore(LOOKUP_CONCURRENCY)
+
+    async def fetch(task: Task):
+        async with limit:
+            return await fetch_review_details(client, task.url, use_tokens=chat_may_use_tokens(task.chat_id))
+
     async with review_client() as client:
-        results = await asyncio.gather(*(fetch_review_details(client, task.url) for task in tasks))
+        results = await asyncio.gather(*(fetch(task) for task in tasks))
     for task, details in zip(tasks, results):
         if details:
-            task.title, task.description = details.title, details.description
-            db.update_task_details(task.id, details.title, details.description)
+            # An empty PR body shouldn't erase a description an MCP agent supplied.
+            description = details.description or task.description or ""
+            task.title, task.description = details.title, description
+            db.update_task_details(task.id, details.title, description)
 
 
 async def reply_privately(update: Update, context: ContextTypes.DEFAULT_TYPE, texts: list[str]) -> None:
@@ -794,6 +833,40 @@ async def post_stop(application: Application) -> None:
         scheduler.shutdown(wait=False)
 
 
+class PerChatUpdateProcessor(BaseUpdateProcessor):
+    """Handle different chats concurrently but each chat's updates in order.
+
+    A slow PR/MR lookup then can't stall other chats, and a command sent right after
+    `!wadd` in the same chat still sees the new review.
+    """
+
+    def __init__(self, max_concurrent_updates: int = 256):
+        super().__init__(max_concurrent_updates)
+        self._locks: dict[int, asyncio.Lock] = {}
+        self._pending: Counter[int] = Counter()
+
+    async def do_process_update(self, update: object, coroutine: Awaitable[Any]) -> None:
+        chat = getattr(update, "effective_chat", None)
+        if chat is None:
+            await coroutine
+            return
+        lock = self._locks.setdefault(chat.id, asyncio.Lock())
+        self._pending[chat.id] += 1
+        try:
+            async with lock:
+                await coroutine
+        finally:
+            self._pending[chat.id] -= 1
+            if not self._pending[chat.id]:
+                del self._pending[chat.id], self._locks[chat.id]
+
+    async def initialize(self) -> None:
+        pass
+
+    async def shutdown(self) -> None:
+        pass
+
+
 def main() -> None:
     """Start the bot."""
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -803,9 +876,8 @@ def main() -> None:
         raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
     
     # Create application
-    # Updates are handled concurrently so a slow PR/MR lookup doesn't stall other chats.
     application = (Application.builder().token(token).post_init(post_init).post_stop(post_stop)
-                   .concurrent_updates(True).build())
+                   .concurrent_updates(PerChatUpdateProcessor()).build())
     
     # Add message handler for all text messages
     application.add_handler(

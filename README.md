@@ -83,6 +83,8 @@ Optional settings for showing PR/MR titles and descriptions:
 GITHUB_TOKEN=github_pat_...
 # GitHub owners (users or orgs) the token may be used for, comma-separated
 GITHUB_ORGS=my-org
+# Chats whose lookups may use the tokens, comma-separated (send !wchatid in the group to get its ID)
+ALLOWED_CHAT_IDS=-1001234567890
 # GitLab instance to fetch merge request details from (default: https://gitlab.com)
 GITLAB_URL=https://gitlab.example.com
 # Needed for private GitLab projects (read_api scope)
@@ -91,7 +93,7 @@ GITLAB_TOKEN=glpat-...
 
 The bot only contacts `api.github.com` and the host in `GITLAB_URL`. Links to other hosts are still accepted but are shown without a title.
 
-Anyone in a chat with the bot can see the title and description of any PR/MR the tokens can read, by adding its link. `GITHUB_TOKEN` is therefore only used for owners listed in `GITHUB_ORGS`; other GitHub PRs are fetched without it, so only public ones get titles. Use a `GITLAB_TOKEN` that can read only your team's projects.
+Anyone in a chat with the bot can see the title and description of any PR/MR the tokens can read, by adding its link. Anyone on Telegram can message the bot or add it to a group, so the tokens are only used for lookups in chats listed in `ALLOWED_CHAT_IDS`, and `GITHUB_TOKEN` only for owners listed in `GITHUB_ORGS`. Everywhere else, lookups run without tokens, so only public PRs/MRs get titles. Use a `GITLAB_TOKEN` that can read only your team's projects. Reviews added through MCP always use the tokens, since MCP requests are authenticated and go to the configured chat.
 
 ### 3. Install Dependencies
 
@@ -352,13 +354,13 @@ Reminders use 5-part cron expressions in UTC timezone:
 - In groups the reply is a Telegram [ephemeral message](https://core.telegram.org/bots/api#ephemeral-messages-and-commands) (Bot API 10.2+): only you and the bot see it. Telegram may drop it if you are offline or after an app restart, so just send `!wme` again.
 - The bot must be a group **admin** to send ephemeral messages. Otherwise it replies with a short notice instead of posting your list publicly. If Telegram ever posts the reply publicly (for example, a self-hosted Bot API server without ephemeral support), the bot deletes it immediately.
 - Your `!wme` message itself stays visible to the group; only the reply is private.
-- In a direct message with the bot, `!wme` lists your reviews from all groups as a normal reply.
+- In a direct message with the bot, `!wme` lists your reviews from all groups you're still a member of, as a normal reply.
 
 `!wdetails` works the same way but lists every review in the chat's queue, not just yours. It only works in groups, so the queue isn't shown to people outside the group.
 
 ## PR/MR Titles
 
-Each queue entry shows its PR/MR title in `!w`, reminders, and command replies, and its description in `!wme`. When a review is added through MCP, the agent passes the title and description, so this also works for GitLab servers the bot can't reach, such as ones behind a VPN. For `!wadd`, the bot fetches them from GitHub or the GitLab host in `GITLAB_URL`. Queue entries added before this feature get their title the next time `!w` or `!wme` runs. If a fetch fails (private repository without a token, network error, or unsupported host), the entry is shown as a link only, and that PR/MR isn't looked up again for 15 minutes. Each lookup is limited to 4 seconds, and other chats keep working while one is in progress.
+Each queue entry shows its PR/MR title in `!w`, reminders, and command replies, and its description in `!wme`. When a review is added through MCP, the agent passes the title and description, so this also works for GitLab servers the bot can't reach, such as ones behind a VPN. For `!wadd`, the bot fetches them from GitHub or the GitLab host in `GITLAB_URL`. Queue entries added before this feature get their title the next time `!w` or `!wme` runs. If a fetch fails (private repository without a token, network error, or unsupported host), the entry is shown as a link only, and that PR/MR isn't looked up again for 15 minutes. Successful lookups are reused for 10 minutes, so repeated `!wme` calls don't use up GitHub's rate limit. Each lookup is limited to 4 seconds, at most 5 run at once, and other chats keep working while one is in progress; commands within a chat still run in the order they were sent.
 
 ## Notes
 

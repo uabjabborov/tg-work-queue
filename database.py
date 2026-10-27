@@ -99,7 +99,12 @@ class Database:
             # PR/MR details are optional; entries added before this stay link-only until refreshed.
             for column in ("title", "description"):
                 if column not in columns:
-                    conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} TEXT")
+                    try:
+                        conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} TEXT")
+                    except sqlite3.OperationalError as error:
+                        # The bot and MCP server start together; the other one may have added it.
+                        if "duplicate column name" not in str(error):
+                            raise
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS task_assignees (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,

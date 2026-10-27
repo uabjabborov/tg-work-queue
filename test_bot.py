@@ -1,3 +1,4 @@
+import asyncio
 import sqlite3
 import tempfile
 import unittest
@@ -242,7 +243,7 @@ class ReviewDetailsCommandTests(unittest.IsolatedAsyncioTestCase):
         db_patch.start()
         self.addCleanup(db_patch.stop)
         self.details = {}
-        self.fetch_details = AsyncMock(side_effect=lambda client, url: self.details.get(url))
+        self.fetch_details = AsyncMock(side_effect=lambda client, url, use_tokens=False: self.details.get(url))
         fetch_patch = patch.object(bot, "fetch_review_details", self.fetch_details)
         fetch_patch.start()
         self.addCleanup(fetch_patch.stop)
@@ -264,13 +265,21 @@ class ReviewDetailsCommandTests(unittest.IsolatedAsyncioTestCase):
             effective_user=SimpleNamespace(id=user_id, username=username, first_name="Alice", is_bot=False),
         )
 
-    def make_bot(self, send_message=None, bot_status="administrator"):
+    def make_bot(self, send_message=None, bot_status="administrator", member_statuses=None):
+        def chat_member(chat_id, user_id):
+            if user_id == 99:
+                return SimpleNamespace(status=bot_status)
+            status = (member_statuses or {}).get(chat_id, "member")
+            if isinstance(status, Exception):
+                raise status
+            return SimpleNamespace(status=status, is_member=False)
+
         return SimpleNamespace(
             id=99,
             # Telegram returns message ID 0 for ephemeral messages.
             send_message=send_message or AsyncMock(return_value=SimpleNamespace(message_id=0)),
             delete_message=AsyncMock(),
-            get_chat_member=AsyncMock(return_value=SimpleNamespace(status=bot_status)),
+            get_chat_member=AsyncMock(side_effect=chat_member),
         )
 
     async def send(self, update, telegram_bot=None):
@@ -302,6 +311,68 @@ class ReviewDetailsCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(">repo/1</a> — Old title → @bob (by @author)", text)
         self.assertIn(">repo/2</a> — Add &lt;cache&gt; &amp; docs → @bob (by @Alice)", text)
         self.assertEqual(self.db.get_tasks(1)[0].title, "Old title")
+
+    async def test_lookups_use_tokens_only_in_allowed_chats(self):
+        self.add_task(1, ["@alice"], chat_id=1)
+        self.add_task(2, ["@alice"], chat_id=-100)
+        with patch.dict("os.environ", {"ALLOWED_CHAT_IDS": "-100"}):
+            await self.send(self.make_update("!wadd https://github.com/owner/repo/pull/3", chat_id=1))
+            await self.send(self.make_update("!wadd https://github.com/owner/repo/pull/4", chat_id=-100))
+            await self.send(self.make_update("!wme", chat_type="private", chat_id=7))
+
+        calls = {call.args[1].rsplit("/", 1)[-1]: call.kwargs["use_tokens"] for call in self.fetch_details.await_args_list}
+        self.assertEqual(calls, {"3": False, "4": True, "1": False, "2": True})
+
+    async def test_refresh_keeps_saved_description_when_pr_body_is_empty(self):
+        url = self.add_task(1, ["@alice"], title="Old", description="Agent notes")
+        self.details[url] = ReviewDetails("New title", "")
+
+        await self.send(self.make_update("!wme"))
+
+        task, = self.db.get_tasks(1)
+        self.assertEqual((task.title, task.description), ("New title", "Agent notes"))
+
+    async def test_refresh_limits_concurrent_lookups(self):
+        for number in range(1, 13):
+            self.add_task(number, ["@alice"])
+        running = peak = 0
+
+        async def slow_fetch(client, url, use_tokens=False):
+            nonlocal running, peak
+            running += 1
+            peak = max(peak, running)
+            await asyncio.sleep(0.01)
+            running -= 1
+
+        self.fetch_details.side_effect = slow_fetch
+        await self.send(self.make_update("!wme"))
+
+        self.assertEqual(self.fetch_details.await_count, 12)
+        self.assertEqual(peak, bot.LOOKUP_CONCURRENCY)
+
+    async def test_updates_run_in_order_per_chat_and_concurrently_across_chats(self):
+        processor = bot.PerChatUpdateProcessor()
+        events = []
+
+        async def handler(name, delay):
+            events.append(f"start {name}")
+            await asyncio.sleep(delay)
+            events.append(f"end {name}")
+
+        def update(chat_id):
+            return SimpleNamespace(effective_chat=SimpleNamespace(id=chat_id))
+
+        await asyncio.gather(
+            processor.do_process_update(update(1), handler("wadd", 0.05)),
+            processor.do_process_update(update(1), handler("wassign", 0)),
+            processor.do_process_update(update(2), handler("other chat", 0)),
+            processor.do_process_update(SimpleNamespace(effective_chat=None), handler("no chat", 0)),
+        )
+
+        self.assertLess(events.index("end wadd"), events.index("start wassign"))
+        self.assertLess(events.index("end other chat"), events.index("end wadd"))
+        self.assertLess(events.index("end no chat"), events.index("end wadd"))
+        self.assertEqual(processor._locks, {})
 
     async def test_duplicate_wadd_is_rejected_without_fetching(self):
         url = self.add_task(1, ["@bob"])
@@ -383,20 +454,27 @@ class ReviewDetailsCommandTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("ephemeral_message_parameters", telegram_bot.send_message.await_args.kwargs["api_kwargs"])
                 update.message.reply_text.assert_not_awaited()
 
-    async def test_wme_in_private_chat_lists_assignments_from_every_group(self):
+    async def test_wme_in_private_chat_lists_assignments_from_groups_the_sender_is_in(self):
         self.add_task(1, ["@alice"], chat_id=-100)
         self.add_task(2, ["@bob"], chat_id=-100)
         self.add_task(3, ["@Alice"], chat_id=-200)
+        self.add_task(4, ["@alice"], chat_id=-300, title="Left group")
+        self.add_task(5, ["@alice"], chat_id=-400, title="Unknown group")
+        self.add_task(6, ["@alice"], chat_id=-500)
         update = self.make_update("!wme", chat_type="private", chat_id=7)
+        statuses = {-200: "administrator", -300: "left", -400: BadRequest("Chat not found"), -500: "restricted"}
 
-        telegram_bot = await self.send(update)
+        telegram_bot = await self.send(update, self.make_bot(member_statuses=statuses))
 
         telegram_bot.send_message.assert_not_awaited()
+        self.assertEqual(sorted(call.args[0] for call in telegram_bot.get_chat_member.await_args_list),
+                         [-500, -400, -300, -200, -100])
         reply = update.message.reply_text.await_args.args[0]
         self.assertIn("Assigned to you (2)", reply)
         self.assertIn(">repo/1</a>", reply)
         self.assertIn(">repo/3</a>", reply)
-        self.assertNotIn(">repo/2</a>", reply)
+        for hidden in (">repo/2</a>", "Left group", "Unknown group", ">repo/6</a>"):
+            self.assertNotIn(hidden, reply)
 
     async def test_wme_deletes_reply_that_telegram_posted_publicly(self):
         self.add_task(1, ["@alice"], title="Secret plan")
@@ -474,6 +552,26 @@ class ReviewDetailsCommandTests(unittest.IsolatedAsyncioTestCase):
     def test_visible_length_ignores_markup_and_counts_like_telegram(self):
         self.assertEqual(visible_length('<a href="https://example.com/very/long">repo/1</a> &lt;b&gt;'), 10)
         self.assertEqual(visible_length("👍"), 2)
+
+    def test_migration_tolerates_a_concurrent_process_adding_columns(self):
+        class StaleSchemaConnection(sqlite3.Connection):
+            """Reports the pre-migration schema, as if another process added the columns since."""
+            def execute(self, sql, *args):
+                if sql == "PRAGMA table_info(tasks)":
+                    return iter([{"name": "created_by_id"}])
+                return super().execute(sql, *args)
+
+        def stale_connection(database):
+            conn = sqlite3.connect(database.db_path, factory=StaleSchemaConnection)
+            conn.row_factory = sqlite3.Row
+            return conn
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = str(Path(temp_dir) / "shared.db")
+            Database(path)
+            with patch.object(Database, "_get_connection", stale_connection):
+                Database(path)
+            self.assertEqual(Database(path).get_tasks(1), [])
 
     def test_existing_databases_gain_detail_columns(self):
         with tempfile.TemporaryDirectory() as temp_dir:

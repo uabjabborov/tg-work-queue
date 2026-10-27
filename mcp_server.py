@@ -149,7 +149,8 @@ def create_server(db: Database, bot_token: str, chat_id: int) -> MCPServer:
         if not title:
             # Agents usually know the title; otherwise try the bot's own lookup (e.g. public GitHub).
             async with review_client() as client:
-                details = await fetch_review_details(client, url)
+                # Requests are authenticated per person and target the configured team chat.
+                details = await fetch_review_details(client, url, use_tokens=True)
             if details:
                 title, description = details.title, description or details.description
 
