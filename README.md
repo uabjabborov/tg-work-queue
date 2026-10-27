@@ -13,6 +13,7 @@ A Telegram bot that manages task queues for GitLab/GitHub merge requests in chan
 | `!wdone <PR/MR reference>` | Remove a completed review |
 | `!wbounce <PR/MR reference>` | Remove a review with a "Changes required" comment in the chat |
 | `!wassign <PR/MR reference> @username [...]` | Assign or reassign a review (replaces all existing assignees) |
+| `!wchatid` | Show this chat's ID, for [connecting AI agents](#ai-agents-mcp) |
 | `!whelp` | Show help instructions |
 
 ### Reminders
@@ -83,6 +84,7 @@ This includes:
 - `python-telegram-bot` - Telegram Bot API wrapper
 - `python-dotenv` - Environment variable management
 - `APScheduler` - Cron-based reminder scheduling
+- `mcp` and `uvicorn` - Optional MCP server for AI agents
 
 ### 4. Run the Bot
 
@@ -113,6 +115,66 @@ docker-compose down
 1. Add the bot to your Telegram channel or group
 2. Make the bot an **admin** with "Post Messages" permission
 3. Start using commands!
+
+## AI Agents (MCP)
+
+AI coding agents such as Claude Code, Codex, and Conductor can queue reviews through an [MCP](https://modelcontextprotocol.io) server. Ask the agent something like *"add my PR to the review queue for @alice and tell her to focus on the migration"*. The bot then posts this in the group:
+
+```
+repo/45 → @alice (by @dave)
+┃ Please focus on the migration in 0042_orders.py
+```
+
+| Tool | Description |
+|------|-------------|
+| `add_review(url, reviewers?, note?)` | Same as `!wadd`. Optional `note` is posted as a quote for reviewers (up to 1000 characters) |
+| `list_reviews()` | Same as `!w` |
+
+Telegram doesn't deliver one bot's messages to another bot, so the MCP server doesn't send `!wadd` text. Instead it adds reviews to the bot's database directly and posts the announcement through the Bot API.
+
+### Server Setup
+
+1. In the group, send `!wchatid` and copy the ID.
+2. Create a token for each teammate who will use an agent:
+
+   ```bash
+   python -c "import secrets; print(secrets.token_urlsafe(32))"
+   ```
+
+3. Add to `.env`:
+
+   ```
+   MCP_CHAT_ID=-1001234567890
+   # token=@telegram_username[:telegram_user_id], comma-separated
+   MCP_TOKENS=Zx8...=@dave,Q3k...=@erin:123456789
+   ```
+
+   Each token identifies the person who submitted the review, so agent-submitted reviews earn leaderboard credit like `!wadd`. Write the name exactly as the bot shows it in `!w`: `@username`, or the first name for people without a username. Otherwise credit goes to a separate person. The user ID is optional and keeps credit together if the name changes.
+
+4. Start the MCP service with the bot:
+
+   ```bash
+   docker compose --profile mcp up -d
+   ```
+
+   It listens at `http://127.0.0.1:8090/mcp`. To use it from teammates' machines, serve it over HTTPS with a reverse proxy, such as Caddy or nginx. To run it without Docker, use `python mcp_server.py`. Optional settings are `MCP_HOST` (default `127.0.0.1`) and `MCP_PORT` (default `8090`).
+
+### Connect an Agent
+
+**Claude Code** (also used by Conductor):
+
+```bash
+claude mcp add --scope user --transport http workqueue https://workqueue.example.com/mcp \
+  --header "Authorization: Bearer <your token>"
+```
+
+**Codex** (`~/.codex/config.toml`, with `WORKQUEUE_MCP_TOKEN` exported in your shell):
+
+```toml
+[mcp_servers.workqueue]
+url = "https://workqueue.example.com/mcp"
+bearer_token_env_var = "WORKQUEUE_MCP_TOKEN"
+```
 
 ## Usage Examples
 

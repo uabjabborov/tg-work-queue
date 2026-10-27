@@ -9,3 +9,22 @@ services:
       - ./data:/app/data
     env_file:
       - .env
+
+  # MCP endpoint for AI agents (Claude Code, Codex, Conductor). Published on localhost only,
+  # for an HTTPS proxy on this host; set MCP_BIND=0.0.0.0 only if the proxy runs elsewhere.
+  # Opt-in: start it with `docker compose --profile mcp up -d`.
+  mcp:
+    build: .
+    profiles: ["mcp"]
+    command: ["python", "mcp_server.py"]
+    restart: unless-stopped
+    environment:
+      - DATA_DIR=/app/data
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=8090
+    ports:
+      - "${MCP_BIND:-127.0.0.1}:${MCP_PORT:-8090}:8090"
+    volumes:
+      - ./data:/app/data
+    env_file:
+      - .env

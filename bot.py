@@ -38,6 +38,7 @@ WDONE_PREFIX = re.compile(r"^!wdone\b", re.IGNORECASE)
 WBOUNCE_PATTERN = re.compile(r"^!wbounce\s+(.+)$", re.IGNORECASE)
 WBOUNCE_PREFIX = re.compile(r"^!wbounce\b", re.IGNORECASE)
 WHELP_PATTERN = re.compile(r"^!whelp$", re.IGNORECASE)
+WCHATID_PATTERN = re.compile(r"^!wchatid$", re.IGNORECASE)
 WREMINDER_STATUS_PATTERN = re.compile(r"^!wreminder$", re.IGNORECASE)
 WREMINDER_SET_PATTERN = re.compile(r"^!wreminder-set\s+(.+)$", re.IGNORECASE)
 WREMINDER_OFF_PATTERN = re.compile(r"^!wreminder-off$", re.IGNORECASE)
@@ -243,6 +244,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Check for !whelp command
     if WHELP_PATTERN.match(text):
         await handle_whelp(update)
+        return
+
+    if WCHATID_PATTERN.match(text):
+        await update.message.reply_text(
+            f"This chat's ID is <code>{chat_id}</code>. Use it as <code>MCP_CHAT_ID</code> for the MCP server.",
+            parse_mode=ParseMode.HTML
+        )
         return
 
     if WLEADERBOARD_OFF_PATTERN.match(text):
@@ -453,6 +461,9 @@ Recaps: Monday at 09:00 Asia/Tashkent, covering the previous Monday–Sunday.
 • !wbounce: reviewer point for the command sender; no contributor point
 • Self-reviews earn no reviewer points. Assignees do not receive points automatically.
 • Each person earns at most one point per PR/MR per ranking per completion week, even if re-added.
+
+<code>!wchatid</code>
+Show this chat's ID for connecting AI agents through the MCP server
 
 <code>!whelp</code>
 Show this help message

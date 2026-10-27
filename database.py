@@ -271,6 +271,8 @@ class Database:
         """Add a task. Returns sequence number if added, None if already exists."""
         try:
             with self._get_connection() as conn:
+                # The bot and MCP server both write; lock before reading the counter.
+                conn.execute("BEGIN IMMEDIATE")
                 seq_num = self._get_next_seq_num(conn, chat_id)
                 # Keep assigned_to for backward compatibility (use first assignee or 'unassigned')
                 assigned_to = assignees[0] if assignees else "unassigned"
