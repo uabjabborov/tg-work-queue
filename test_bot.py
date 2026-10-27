@@ -1,10 +1,15 @@
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from database import Database
+from telegram.error import BadRequest
+
+from database import Database, Task
+from presentation import assigned_reviews
+from review_details import ReviewDetails
 from scheduler import send_reminder
 
 with patch.object(Database, "_init_db"):
@@ -19,6 +24,10 @@ class QueueReferenceTests(unittest.IsolatedAsyncioTestCase):
         db_patch = patch.object(bot, "db", self.db)
         db_patch.start()
         self.addCleanup(db_patch.stop)
+        self.fetch_details = AsyncMock(return_value=None)
+        fetch_patch = patch.object(bot, "fetch_review_details", self.fetch_details)
+        fetch_patch.start()
+        self.addCleanup(fetch_patch.stop)
 
     def add_task(self, chat_id=1, task_id="repo/120", url=None, assignees=None, created_by="@author"):
         repo, number = task_id.split("/")
@@ -222,6 +231,165 @@ class QueueReferenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(bot.extract_task_id("https://github.com/owner/repo/pull/123/files"))
         self.assertIsNone(bot.extract_task_id("ftp://github.com/owner/repo/pull/123"))
         self.assertIsNone(bot.extract_task_id("https://[broken/owner/repo/pull/123"))
+
+
+class ReviewDetailsCommandTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.db = Database(str(Path(temp_dir.name) / "workqueue.db"))
+        db_patch = patch.object(bot, "db", self.db)
+        db_patch.start()
+        self.addCleanup(db_patch.stop)
+        self.details = {}
+        self.fetch_details = AsyncMock(side_effect=lambda client, url: self.details.get(url))
+        fetch_patch = patch.object(bot, "fetch_review_details", self.fetch_details)
+        fetch_patch.start()
+        self.addCleanup(fetch_patch.stop)
+
+    def add_task(self, number, assignees, chat_id=1, title=None, description=None):
+        url = f"https://github.com/owner/repo/pull/{number}"
+        self.db.add_task(chat_id, f"repo/{number}", url, assignees, "@author", title=title, description=description)
+        return url
+
+    def make_update(self, text, chat_type="supergroup", username="Alice", user_id=7, anonymous=False, topic=None):
+        return SimpleNamespace(
+            message=SimpleNamespace(
+                text=text, reply_text=AsyncMock(),
+                sender_chat=object() if anonymous else None,
+                is_topic_message=topic is not None, message_thread_id=topic,
+            ),
+            effective_chat=SimpleNamespace(id=1, type=chat_type),
+            effective_user=SimpleNamespace(id=user_id, username=username, first_name="Alice", is_bot=False),
+        )
+
+    async def send(self, update, send_message=None):
+        context = SimpleNamespace(bot=SimpleNamespace(send_message=send_message or AsyncMock()))
+        await bot.handle_message(update, context)
+        return context.bot.send_message
+
+    async def test_wadd_saves_title_and_list_backfills_older_entries(self):
+        new_url = "https://github.com/owner/repo/pull/2"
+        old_url = self.add_task(1, ["@bob"])
+        self.details[new_url] = ReviewDetails("Add <cache> & docs", "Body")
+        update = self.make_update(f"!wadd {new_url} @bob")
+        await self.send(update)
+
+        update.message.reply_text.assert_awaited_once()
+        self.assertEqual(
+            update.message.reply_text.await_args.args[0],
+            f'<a href="{new_url}">repo/2</a> — Add &lt;cache&gt; &amp; docs → @bob',
+        )
+        self.assertEqual(self.db.get_tasks(1)[1].description, "Body")
+
+        self.details[old_url] = ReviewDetails("Old title", "")
+        self.fetch_details.reset_mock()
+        listing = self.make_update("!w")
+        await self.send(listing)
+
+        self.assertEqual([call.args[1] for call in self.fetch_details.await_args_list], [old_url])
+        text = listing.message.reply_text.await_args.args[0]
+        self.assertIn(">repo/1</a> — Old title → @bob (by @author)", text)
+        self.assertIn(">repo/2</a> — Add &lt;cache&gt; &amp; docs → @bob (by @Alice)", text)
+        self.assertEqual(self.db.get_tasks(1)[0].title, "Old title")
+
+    async def test_wme_sends_only_the_senders_reviews_as_ephemeral_message(self):
+        mine = self.add_task(1, ["@bob", "@alice"], title="Stale title")
+        self.add_task(2, ["@bob"])
+        self.add_task(3, ["@ALICE"], description="Saved <b>body</b>")
+        self.add_task(4, ["@alice"], chat_id=2)
+        self.details[mine] = ReviewDetails("Fresh title", "Line one\nLine two")
+        update = self.make_update("!WME", topic=55)
+
+        send_message = await self.send(update)
+
+        send_message.assert_awaited_once()
+        args, kwargs = send_message.await_args
+        self.assertEqual(args[0], 1)
+        self.assertEqual(kwargs["api_kwargs"], {"ephemeral_message_parameters": {"receiver_user_id": 7}})
+        self.assertEqual(kwargs["message_thread_id"], 55)
+        self.assertEqual(kwargs["parse_mode"], "HTML")
+        self.assertTrue(kwargs["disable_web_page_preview"])
+        self.assertEqual(args[1], (
+            "<b>Assigned to you (2)</b>\n\n"
+            f'<a href="{mine}">repo/1</a> — Fresh title → @alice, @bob (by @author)\n'
+            "<blockquote expandable>Line one\nLine two</blockquote>\n\n"
+            '<a href="https://github.com/owner/repo/pull/3">repo/3</a> → @ALICE (by @author)\n'
+            "<blockquote expandable>Saved &lt;b&gt;body&lt;/b&gt;</blockquote>"
+        ))
+        update.message.reply_text.assert_not_awaited()
+        self.assertEqual(self.db.get_tasks(1)[0].title, "Fresh title")
+
+    async def test_wme_without_assignments_or_username_still_replies_privately(self):
+        self.add_task(1, ["@bob"])
+        for username, expected in ((("alice", "No reviews are assigned to you")),
+                                   (None, "Set a Telegram username")):
+            with self.subTest(username=username):
+                update = self.make_update("!wme", username=username)
+                send_message = await self.send(update)
+                self.assertIn(expected, send_message.await_args.args[1])
+                self.assertIn("ephemeral_message_parameters", send_message.await_args.kwargs["api_kwargs"])
+                update.message.reply_text.assert_not_awaited()
+
+    async def test_wme_in_private_chat_uses_normal_reply(self):
+        self.add_task(1, ["@alice"])
+        update = self.make_update("!wme", chat_type="private")
+
+        send_message = await self.send(update)
+
+        send_message.assert_not_awaited()
+        self.assertIn(">repo/1</a>", update.message.reply_text.await_args.args[0])
+
+    async def test_wme_never_posts_the_list_publicly_when_ephemeral_send_fails(self):
+        self.add_task(1, ["@alice"], title="Secret plan")
+        update = self.make_update("!wme")
+
+        await self.send(update, AsyncMock(side_effect=BadRequest("Not enough rights")))
+
+        reply = update.message.reply_text.await_args.args[0]
+        self.assertIn("Make me a group admin", reply)
+        self.assertNotIn("Secret plan", reply)
+
+    async def test_wme_rejects_anonymous_admins(self):
+        anonymous = self.make_update("!wme", anonymous=True)
+        send_message = await self.send(anonymous)
+        send_message.assert_not_awaited()
+        self.assertIn("anonymously", anonymous.message.reply_text.await_args.args[0])
+
+    def test_long_assignment_lists_drop_descriptions_then_truncate(self):
+        tasks = [
+            Task(i, 1, i, f"repo/{i}", f"https://github.com/o/repo/pull/{i}", ["@alice"], "@author", None,
+                 title="T" * 200, description="D" * 2000)
+            for i in range(1, 60)
+        ]
+        compact = assigned_reviews(tasks[:8])
+        self.assertNotIn("blockquote", compact)
+        self.assertEqual(compact.count("(by @author)"), 8)
+
+        truncated = assigned_reviews(tasks)
+        self.assertLessEqual(len(truncated), 4096)
+        self.assertIn("more. Use <code>!w</code> for the full queue.", truncated)
+
+    def test_existing_databases_gain_detail_columns(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = str(Path(temp_dir) / "old.db")
+            with sqlite3.connect(path) as conn:
+                conn.execute("""
+                    CREATE TABLE tasks (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, seq_num INTEGER NOT NULL,
+                        task_id TEXT NOT NULL, url TEXT NOT NULL, assigned_to TEXT NOT NULL,
+                        created_by TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                conn.execute("""
+                    INSERT INTO tasks (chat_id, seq_num, task_id, url, assigned_to, created_by)
+                    VALUES (1, 1, 'repo/1', 'https://github.com/o/repo/pull/1', 'unassigned', '@author')
+                """)
+            db = Database(path)
+            task, = db.get_tasks(1)
+            self.assertIsNone(task.title)
+            db.update_task_details(task.id, "Title", "Body")
+            self.assertEqual((db.get_tasks(1)[0].title, db.get_tasks(1)[0].description), ("Title", "Body"))
 
 
 if __name__ == "__main__":

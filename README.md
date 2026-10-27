@@ -10,6 +10,7 @@ A Telegram bot that manages task queues for GitLab/GitHub merge requests in chan
 |---------|-------------|
 | `!wadd <MR/PR URL> [@username ...]` | Add a merge request (optionally assign to one or more users) |
 | `!w` | List all tasks in the queue |
+| `!wme` | Privately show reviews assigned to you, with descriptions |
 | `!wdone <PR/MR reference>` | Remove a completed review |
 | `!wbounce <PR/MR reference>` | Remove a review with a "Changes required" comment in the chat |
 | `!wassign <PR/MR reference> @username [...]` | Assign or reassign a review (replaces all existing assignees) |
@@ -73,6 +74,19 @@ Create a `.env` file with your bot token:
 ```
 TELEGRAM_BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
 ```
+
+Optional settings for showing PR/MR titles and descriptions:
+
+```
+# Needed for private GitHub repositories; also raises GitHub's rate limit
+GITHUB_TOKEN=github_pat_...
+# GitLab instance to fetch merge request details from (default: https://gitlab.com)
+GITLAB_URL=https://gitlab.example.com
+# Needed for private GitLab projects (read_api scope)
+GITLAB_TOKEN=glpat-...
+```
+
+The bot only contacts `api.github.com` and the host in `GITLAB_URL`. Links to other hosts are still accepted but are shown without a title.
 
 ### 3. Install Dependencies
 
@@ -203,8 +217,17 @@ bearer_token_env_var = "WORKQUEUE_MCP_TOKEN"
 !w
 
 # Response:
-# monorepo/120 → @alice, @bob (by @dave)
-# backend/45 (by @dave)
+# monorepo/120 — Fix login redirect → @alice, @bob (by @dave)
+# backend/45 — Add rate limiting (by @dave)
+
+# Show reviews assigned to you (only you see the reply)
+!wme
+
+# Response (visible only to @alice):
+# Assigned to you (1)
+#
+# monorepo/120 — Fix login redirect → @alice, @bob (by @dave)
+# > Redirect users back to the page they came from after login… (collapsed)
 
 # Assign or reassign a task (replaces all existing assignees)
 !wassign monorepo/120 @eve
@@ -310,11 +333,24 @@ Reminders use 5-part cron expressions in UTC timezone:
 - **Multiple Assignees**: Assign tasks to multiple team members
 - **Isolated Queues**: Each channel/group has its own independent task queue
 - **Unique Tasks**: PR/MR references are unique per channel (the same MR can't be added twice)
-- **Clickable Links**: Tasks are displayed as clickable links to the MR/PR
+- **Clickable Links**: Tasks are displayed as clickable links to the MR/PR, followed by the PR/MR title
+- **Private Assignment View**: `!wme` replies with an ephemeral message only the sender can see
 - **Custom Reminders**: Each channel can configure its own reminder schedule
 - **Weekly Leaderboards**: Separate contributor and reviewer rankings and Monday recaps for each chat
 - **Persistent Storage**: Data is stored in SQLite database (`workqueue.db`)
 - **Flexible Assignment**: Reassign tasks at any time, replacing all existing assignees
+
+## Private Replies (`!wme`)
+
+`!wme` lists the reviews in the current chat whose assignees include your `@username`, with fresh titles and a collapsed description preview.
+
+- In groups the reply is a Telegram [ephemeral message](https://core.telegram.org/bots/api#ephemeral-messages-and-commands) (Bot API 10.2+): only you and the bot see it. Telegram may drop it if you are offline or after an app restart, so just send `!wme` again.
+- The bot must be a group **admin** to send ephemeral messages. Otherwise it replies with a short notice instead of posting your list publicly.
+- In a private chat with the bot, the list is sent as a normal reply.
+
+## PR/MR Titles
+
+When a PR/MR is added, the bot fetches its title and description and shows the title in `!w`, reminders, and command replies. Queue entries added before this feature get their title the next time `!w` or `!wme` runs. If a fetch fails (private repository without a token, network error, or unsupported host), the entry is shown as a link only.
 
 ## Notes
 

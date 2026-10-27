@@ -30,6 +30,8 @@ class Task:
     created_by: str
     created_at: datetime
     created_by_id: Optional[int] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
 
 
 @dataclass
@@ -94,6 +96,10 @@ class Database:
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
             if "created_by_id" not in columns:
                 conn.execute("ALTER TABLE tasks ADD COLUMN created_by_id INTEGER")
+            # PR/MR details are optional; entries added before this stay link-only until refreshed.
+            for column in ("title", "description"):
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} TEXT")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS task_assignees (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -267,7 +273,8 @@ class Database:
         """, (chat_id, timestamp, timestamp, timestamp))
 
     def add_task(self, chat_id: int, task_id: str, url: str, assignees: list[str], created_by: str,
-                 created_by_id: Optional[int] = None, now: Optional[datetime] = None) -> Optional[int]:
+                 created_by_id: Optional[int] = None, now: Optional[datetime] = None,
+                 title: Optional[str] = None, description: Optional[str] = None) -> Optional[int]:
         """Add a task. Returns sequence number if added, None if already exists."""
         try:
             with self._get_connection() as conn:
@@ -280,10 +287,12 @@ class Database:
                 
                 cursor = conn.execute(
                     """
-                    INSERT INTO tasks (chat_id, seq_num, task_id, url, assigned_to, created_by, created_by_id, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO tasks (chat_id, seq_num, task_id, url, assigned_to, created_by, created_by_id, created_at,
+                                       title, description)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (chat_id, seq_num, task_id, url, assigned_to, created_by, created_by_id, timestamp)
+                    (chat_id, seq_num, task_id, url, assigned_to, created_by, created_by_id, timestamp,
+                     title, description)
                 )
                 
                 # Get the inserted task id and add assignees
@@ -322,8 +331,18 @@ class Database:
             assignees=assignees,
             created_by=row["created_by"],
             created_at=row["created_at"],
-            created_by_id=row["created_by_id"]
+            created_by_id=row["created_by_id"],
+            title=row["title"],
+            description=row["description"]
         )
+
+    def update_task_details(self, task_db_id: int, title: str, description: str) -> None:
+        """Save the latest PR/MR title and description for a queue entry."""
+        with self._get_connection() as conn:
+            conn.execute(
+                "UPDATE tasks SET title = ?, description = ? WHERE id = ?",
+                (title, description, task_db_id)
+            )
 
     def remove_task_by_id(self, chat_id: int, task_id: str) -> Optional[Task]:
         """Remove and archive a task without an identified reviewer."""

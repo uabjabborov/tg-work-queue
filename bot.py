@@ -1,3 +1,4 @@
+import asyncio
 import os
 import re
 import logging
@@ -5,12 +6,14 @@ from typing import Optional
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
-from telegram.constants import ParseMode
+from telegram.constants import ChatType, ParseMode
+from telegram.error import TelegramError
 from html import escape as html_escape
 
 from database import Database, Task
 from leaderboard import build_leaderboard, format_leaderboard, reporting_week
-from presentation import review_link, task_listing
+from presentation import assigned_reviews, review_heading, review_link, task_listing
+from review_details import fetch_review_details, review_client
 from review_urls import normalize_review_number, parse_review_url
 from scheduler import add_reminder_job, remove_reminder_job, setup_scheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -33,6 +36,7 @@ WADD_PATTERN_WITH_USER = re.compile(r"^!wadd\s+(https?://\S+)\s+((?:@\w+\s*)+)$"
 WADD_PATTERN_NO_USER = re.compile(r"^!wadd\s+(https?://\S+)$", re.IGNORECASE)
 WADD_PREFIX = re.compile(r"^!wadd\b", re.IGNORECASE)
 W_PATTERN = re.compile(r"^!w$", re.IGNORECASE)
+WME_PATTERN = re.compile(r"^!wme$", re.IGNORECASE)
 WDONE_PATTERN = re.compile(r"^!wdone\s+(.+)$", re.IGNORECASE)
 WDONE_PREFIX = re.compile(r"^!wdone\b", re.IGNORECASE)
 WBOUNCE_PATTERN = re.compile(r"^!wbounce\s+(.+)$", re.IGNORECASE)
@@ -211,6 +215,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if W_PATTERN.match(text):
         await handle_w(update, chat_id)
         return
+
+    if WME_PATTERN.match(text):
+        await handle_wme(update, context, chat_id)
+        return
     
     # Check for !wdone command
     wdone_match = WDONE_PATTERN.match(text)
@@ -332,11 +340,16 @@ async def handle_wadd(update: Update, chat_id: int, url: str, assignees: list[st
         )
         return
     
-    if db.add_task(chat_id, task_id, url, assignees, created_by, created_by_id) is None:
+    async with review_client() as client:
+        details = await fetch_review_details(client, url)
+    title = details.title if details else None
+    description = details.description if details else None
+    if db.add_task(chat_id, task_id, url, assignees, created_by, created_by_id,
+                   title=title, description=description) is None:
         await update.message.reply_text(f"PR/MR reference {task_id} already exists in the queue.")
         return
     
-    response = review_link(task_id, url)
+    response = review_heading(task_id, url, title)
     if assignees:
         assignees_formatted = ", ".join(html_escape(a) for a in assignees)
         response += f" → {assignees_formatted}"
@@ -354,8 +367,61 @@ async def handle_w(update: Update, chat_id: int) -> None:
         await update.message.reply_text("No tasks in the queue.")
         return
     
+    await refresh_task_details([task for task in tasks if not task.title])
     response = "\n".join(task_listing(task) for task in tasks)
     await update.message.reply_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+async def handle_wme(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """Handle !wme command - privately show reviews assigned to the sender."""
+    user_id, _ = sender_identity(update)
+    if user_id is None:
+        await update.message.reply_text("<code>!wme</code> needs to know who you are. Send it from your own account, not anonymously.",
+                                        parse_mode=ParseMode.HTML)
+        return
+
+    username = update.effective_user.username
+    if not username:
+        await reply_privately(update, context, "Set a Telegram username to use <code>!wme</code>. Reviews are assigned by @username.")
+        return
+
+    mention = f"@{username}".lower()
+    tasks = [task for task in db.get_tasks(chat_id) if mention in (assignee.lower() for assignee in task.assignees)]
+    # Fetch fresh titles and descriptions; the list is short and only the requester sees it.
+    await refresh_task_details(tasks)
+    await reply_privately(update, context, assigned_reviews(tasks))
+
+
+async def refresh_task_details(tasks: list[Task]) -> None:
+    """Fetch PR/MR titles and descriptions, keeping saved values when a fetch fails."""
+    if not tasks:
+        return
+    async with review_client() as client:
+        results = await asyncio.gather(*(fetch_review_details(client, task.url) for task in tasks))
+    for task, details in zip(tasks, results):
+        if details:
+            task.title, task.description = details.title, details.description
+            db.update_task_details(task.id, details.title, details.description)
+
+
+async def reply_privately(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    """Reply so only the sender sees it; in private chats a normal reply is already private."""
+    chat = update.effective_chat
+    if chat.type == ChatType.PRIVATE:
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        return
+
+    # Ephemeral messages (Bot API 10.2+) are not wrapped by python-telegram-bot yet. Admin bots
+    # may send them at any time; Telegram does not guarantee delivery to offline users.
+    try:
+        await context.bot.send_message(
+            chat.id, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+            message_thread_id=update.message.message_thread_id if update.message.is_topic_message else None,
+            api_kwargs={"ephemeral_message_parameters": {"receiver_user_id": update.effective_user.id}},
+        )
+    except TelegramError as error:
+        logger.warning("Could not send ephemeral reply in chat %s: %s", chat.id, error)
+        await update.message.reply_text("I couldn't reply privately. Make me a group admin so I can send replies only you can see.")
 
 
 async def handle_wdone(update: Update, chat_id: int, task_ref: str) -> None:
@@ -387,7 +453,7 @@ async def handle_remove_task(update: Update, chat_id: int, task_ref: str, outcom
         await update.message.reply_text(f"PR/MR reference <code>{html_escape(task_ref)}</code> not found in this chat.", parse_mode=ParseMode.HTML)
         return
     
-    response = f'Removed {review_link(removed_task.task_id, removed_task.url)} (added by {html_escape(removed_task.created_by)})'
+    response = f'Removed {review_heading(removed_task.task_id, removed_task.url, removed_task.title)} (added by {html_escape(removed_task.created_by)})'
     if comment:
         response += f"\n{html_escape(comment)}"
     await update.message.reply_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
@@ -421,6 +487,9 @@ Examples:
 
 <code>!w</code>
 List all tasks in the queue
+
+<code>!wme</code>
+Privately show reviews assigned to you, with descriptions. Only you see the reply.
 
 <code>!wdone &lt;PR/MR reference&gt;</code>
 Remove a completed task by PR/MR reference, URL, or unambiguous PR/MR number
@@ -631,7 +700,7 @@ async def handle_wassign(update: Update, chat_id: int, task_ref: str, assignees:
         await update.message.reply_text(f"PR/MR reference <code>{html_escape(task_ref)}</code> not found in this chat.", parse_mode=ParseMode.HTML)
         return
     
-    response = review_link(updated_task.task_id, updated_task.url)
+    response = review_heading(updated_task.task_id, updated_task.url, updated_task.title)
     if assignees:
         assignees_formatted = ", ".join(html_escape(a) for a in assignees)
         response += f" → {assignees_formatted}"
