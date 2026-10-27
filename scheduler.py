@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from telegram.constants import ParseMode
-from presentation import task_listing
+from presentation import split_messages, task_listing
 from leaderboard import TASHKENT, build_leaderboard, format_leaderboard, most_recent_recap
 
 if TYPE_CHECKING:
@@ -38,13 +38,13 @@ async def send_reminder(chat_id: int, application: "Application", db: "Database"
         lines = ["<b>📋 Reminder: Pending Reviews</b>\n"]
         lines.extend(task_listing(task) for task in tasks)
         
-        message = "\n".join(lines)
-        await application.bot.send_message(
-            chat_id=chat_id,
-            text=message,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True
-        )
+        for message in split_messages(lines):
+            await application.bot.send_message(
+                chat_id=chat_id,
+                text=message,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True
+            )
         logger.info(f"Sent reminder to chat {chat_id} with {len(tasks)} task(s)")
         
     except Exception as e:

@@ -80,6 +80,8 @@ Optional settings for showing PR/MR titles and descriptions:
 ```
 # Needed for private GitHub repositories; also raises GitHub's rate limit
 GITHUB_TOKEN=github_pat_...
+# GitHub owners (users or orgs) the token may be used for, comma-separated
+GITHUB_ORGS=my-org
 # GitLab instance to fetch merge request details from (default: https://gitlab.com)
 GITLAB_URL=https://gitlab.example.com
 # Needed for private GitLab projects (read_api scope)
@@ -87,6 +89,8 @@ GITLAB_TOKEN=glpat-...
 ```
 
 The bot only contacts `api.github.com` and the host in `GITLAB_URL`. Links to other hosts are still accepted but are shown without a title.
+
+Anyone in a chat with the bot can see the title and description of any PR/MR the tokens can read, by adding its link. `GITHUB_TOKEN` is therefore only used for owners listed in `GITHUB_ORGS`; other GitHub PRs are fetched without it, so only public ones get titles. Use a `GITLAB_TOKEN` that can read only your team's projects.
 
 ### 3. Install Dependencies
 
@@ -342,15 +346,16 @@ Reminders use 5-part cron expressions in UTC timezone:
 
 ## Private Replies (`!wme`)
 
-`!wme` lists the reviews in the current chat whose assignees include your `@username`, with fresh titles and a collapsed description preview.
+`!wme` lists the reviews in the current chat whose assignees include your `@username`, with fresh titles and a collapsed description preview. Long lists are split across several messages.
 
 - In groups the reply is a Telegram [ephemeral message](https://core.telegram.org/bots/api#ephemeral-messages-and-commands) (Bot API 10.2+): only you and the bot see it. Telegram may drop it if you are offline or after an app restart, so just send `!wme` again.
-- The bot must be a group **admin** to send ephemeral messages. Otherwise it replies with a short notice instead of posting your list publicly.
-- In a private chat with the bot, the list is sent as a normal reply.
+- The bot must be a group **admin** to send ephemeral messages. Otherwise it replies with a short notice instead of posting your list publicly. If Telegram ever posts the reply publicly (for example, a self-hosted Bot API server without ephemeral support), the bot deletes it immediately.
+- Your `!wme` message itself stays visible to the group; only the reply is private.
+- In a direct message with the bot, `!wme` lists your reviews from all groups as a normal reply.
 
 ## PR/MR Titles
 
-Each queue entry shows its PR/MR title in `!w`, reminders, and command replies, and its description in `!wme`. When a review is added through MCP, the agent passes the title and description, so this also works for GitLab servers the bot can't reach, such as ones behind a VPN. For `!wadd`, the bot fetches them from GitHub or the GitLab host in `GITLAB_URL`. Queue entries added before this feature get their title the next time `!w` or `!wme` runs. If a fetch fails (private repository without a token, network error, or unsupported host), the entry is shown as a link only.
+Each queue entry shows its PR/MR title in `!w`, reminders, and command replies, and its description in `!wme`. When a review is added through MCP, the agent passes the title and description, so this also works for GitLab servers the bot can't reach, such as ones behind a VPN. For `!wadd`, the bot fetches them from GitHub or the GitLab host in `GITLAB_URL`. Queue entries added before this feature get their title the next time `!w` or `!wme` runs. If a fetch fails (private repository without a token, network error, or unsupported host), the entry is shown as a link only, and that PR/MR isn't looked up again for 15 minutes. Each lookup is limited to 4 seconds, and other chats keep working while one is in progress.
 
 ## Notes
 

@@ -320,6 +320,30 @@ class Database:
             )
             return [self._row_to_task(conn, row) for row in cursor.fetchall()]
 
+    def has_task(self, chat_id: int, task_id: str) -> bool:
+        with self._get_connection() as conn:
+            return conn.execute(
+                "SELECT 1 FROM tasks WHERE chat_id = ? AND task_id = ?", (chat_id, task_id)
+            ).fetchone() is not None
+
+    def get_tasks_assigned_to(self, assignee: str, chat_id: Optional[int] = None) -> list[Task]:
+        """Get tasks assigned to a @username, ignoring case, in one chat or across all chats."""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT tasks.*
+                FROM tasks
+                WHERE (? IS NULL OR chat_id = ?)
+                  AND EXISTS (
+                      SELECT 1 FROM task_assignees
+                      WHERE task_assignees.task_id = tasks.id AND LOWER(assignee) = LOWER(?)
+                  )
+                ORDER BY chat_id, seq_num ASC
+                """,
+                (chat_id, chat_id, assignee)
+            )
+            return [self._row_to_task(conn, row) for row in cursor.fetchall()]
+
     def _row_to_task(self, conn: sqlite3.Connection, row: sqlite3.Row) -> Task:
         assignees = self._get_task_assignees(conn, row["id"])
         return Task(

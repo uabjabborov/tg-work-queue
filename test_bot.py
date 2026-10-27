@@ -5,10 +5,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut
 
-from database import Database, Task
-from presentation import assigned_reviews
+from database import Database
+from presentation import visible_length
 from review_details import ReviewDetails
 from scheduler import send_reminder
 
@@ -252,21 +252,31 @@ class ReviewDetailsCommandTests(unittest.IsolatedAsyncioTestCase):
         self.db.add_task(chat_id, f"repo/{number}", url, assignees, "@author", title=title, description=description)
         return url
 
-    def make_update(self, text, chat_type="supergroup", username="Alice", user_id=7, anonymous=False, topic=None):
+    def make_update(self, text, chat_type="supergroup", username="Alice", user_id=7, anonymous=False, topic=None,
+                    chat_id=1):
         return SimpleNamespace(
             message=SimpleNamespace(
                 text=text, reply_text=AsyncMock(),
                 sender_chat=object() if anonymous else None,
                 is_topic_message=topic is not None, message_thread_id=topic,
             ),
-            effective_chat=SimpleNamespace(id=1, type=chat_type),
+            effective_chat=SimpleNamespace(id=chat_id, type=chat_type),
             effective_user=SimpleNamespace(id=user_id, username=username, first_name="Alice", is_bot=False),
         )
 
-    async def send(self, update, send_message=None):
-        context = SimpleNamespace(bot=SimpleNamespace(send_message=send_message or AsyncMock()))
+    def make_bot(self, send_message=None, bot_status="administrator"):
+        return SimpleNamespace(
+            id=99,
+            # Telegram returns message ID 0 for ephemeral messages.
+            send_message=send_message or AsyncMock(return_value=SimpleNamespace(message_id=0)),
+            delete_message=AsyncMock(),
+            get_chat_member=AsyncMock(return_value=SimpleNamespace(status=bot_status)),
+        )
+
+    async def send(self, update, telegram_bot=None):
+        context = SimpleNamespace(bot=telegram_bot or self.make_bot())
         await bot.handle_message(update, context)
-        return context.bot.send_message
+        return context.bot
 
     async def test_wadd_saves_title_and_list_backfills_older_entries(self):
         new_url = "https://github.com/owner/repo/pull/2"
@@ -293,6 +303,35 @@ class ReviewDetailsCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(">repo/2</a> — Add &lt;cache&gt; &amp; docs → @bob (by @Alice)", text)
         self.assertEqual(self.db.get_tasks(1)[0].title, "Old title")
 
+    async def test_duplicate_wadd_is_rejected_without_fetching(self):
+        url = self.add_task(1, ["@bob"])
+        update = self.make_update(f"!wadd {url}")
+
+        await self.send(update)
+
+        self.fetch_details.assert_not_awaited()
+        self.assertIn("already exists", update.message.reply_text.await_args.args[0])
+
+    async def test_long_lists_and_reminders_are_split_under_telegrams_limit(self):
+        for number in range(1, 61):
+            self.add_task(number, ["@alice", "@bob"], title=f"{number} " + "Refactor the order pipeline " * 5)
+        update = self.make_update("!w")
+
+        await self.send(update)
+
+        replies = [call.args[0] for call in update.message.reply_text.await_args_list]
+        self.assertGreater(len(replies), 1)
+        self.assertTrue(all(visible_length(reply) <= 4096 for reply in replies))
+        self.assertEqual(sum(reply.count("(by @author)") for reply in replies), 60)
+
+        send_message = AsyncMock()
+        await send_reminder(1, SimpleNamespace(bot=SimpleNamespace(send_message=send_message)), self.db)
+        reminders = [call.kwargs["text"] for call in send_message.await_args_list]
+        self.assertGreater(len(reminders), 1)
+        self.assertTrue(reminders[0].startswith("<b>📋 Reminder: Pending Reviews</b>\n"))
+        self.assertTrue(all(visible_length(reminder) <= 4096 for reminder in reminders))
+        self.assertEqual(sum(reminder.count("(by @author)") for reminder in reminders), 60)
+
     async def test_wme_sends_only_the_senders_reviews_as_ephemeral_message(self):
         mine = self.add_task(1, ["@bob", "@alice"], title="Stale title")
         self.add_task(2, ["@bob"])
@@ -301,10 +340,10 @@ class ReviewDetailsCommandTests(unittest.IsolatedAsyncioTestCase):
         self.details[mine] = ReviewDetails("Fresh title", "Line one\nLine two")
         update = self.make_update("!WME", topic=55)
 
-        send_message = await self.send(update)
+        telegram_bot = await self.send(update)
 
-        send_message.assert_awaited_once()
-        args, kwargs = send_message.await_args
+        telegram_bot.send_message.assert_awaited_once()
+        args, kwargs = telegram_bot.send_message.await_args
         self.assertEqual(args[0], 1)
         self.assertEqual(kwargs["api_kwargs"], {"ephemeral_message_parameters": {"receiver_user_id": 7}})
         self.assertEqual(kwargs["message_thread_id"], 55)
@@ -318,57 +357,85 @@ class ReviewDetailsCommandTests(unittest.IsolatedAsyncioTestCase):
             "<blockquote expandable>Saved &lt;b&gt;body&lt;/b&gt;</blockquote>"
         ))
         update.message.reply_text.assert_not_awaited()
+        telegram_bot.delete_message.assert_not_awaited()
         self.assertEqual(self.db.get_tasks(1)[0].title, "Fresh title")
+
+    async def test_wme_splits_long_lists_and_keeps_every_description(self):
+        for number in range(1, 31):
+            self.add_task(number, ["@alice"], title="T" * 120, description="D" * 300)
+        update = self.make_update("!wme")
+
+        telegram_bot = await self.send(update)
+
+        messages = [call.args[1] for call in telegram_bot.send_message.await_args_list]
+        self.assertGreater(len(messages), 1)
+        self.assertTrue(all(visible_length(message) <= 4096 for message in messages))
+        self.assertEqual(sum(message.count("<blockquote expandable>") for message in messages), 30)
+        self.assertTrue(messages[0].startswith("<b>Assigned to you (30)</b>"))
 
     async def test_wme_without_assignments_or_username_still_replies_privately(self):
         self.add_task(1, ["@bob"])
-        for username, expected in ((("alice", "No reviews are assigned to you")),
-                                   (None, "Set a Telegram username")):
+        for username, expected in (("alice", "No reviews are assigned to you"), (None, "Set a Telegram username")):
             with self.subTest(username=username):
                 update = self.make_update("!wme", username=username)
-                send_message = await self.send(update)
-                self.assertIn(expected, send_message.await_args.args[1])
-                self.assertIn("ephemeral_message_parameters", send_message.await_args.kwargs["api_kwargs"])
+                telegram_bot = await self.send(update)
+                self.assertIn(expected, telegram_bot.send_message.await_args.args[1])
+                self.assertIn("ephemeral_message_parameters", telegram_bot.send_message.await_args.kwargs["api_kwargs"])
                 update.message.reply_text.assert_not_awaited()
 
-    async def test_wme_in_private_chat_uses_normal_reply(self):
-        self.add_task(1, ["@alice"])
-        update = self.make_update("!wme", chat_type="private")
+    async def test_wme_in_private_chat_lists_assignments_from_every_group(self):
+        self.add_task(1, ["@alice"], chat_id=-100)
+        self.add_task(2, ["@bob"], chat_id=-100)
+        self.add_task(3, ["@Alice"], chat_id=-200)
+        update = self.make_update("!wme", chat_type="private", chat_id=7)
 
-        send_message = await self.send(update)
+        telegram_bot = await self.send(update)
 
-        send_message.assert_not_awaited()
-        self.assertIn(">repo/1</a>", update.message.reply_text.await_args.args[0])
+        telegram_bot.send_message.assert_not_awaited()
+        reply = update.message.reply_text.await_args.args[0]
+        self.assertIn("Assigned to you (2)", reply)
+        self.assertIn(">repo/1</a>", reply)
+        self.assertIn(">repo/3</a>", reply)
+        self.assertNotIn(">repo/2</a>", reply)
 
-    async def test_wme_never_posts_the_list_publicly_when_ephemeral_send_fails(self):
+    async def test_wme_deletes_reply_that_telegram_posted_publicly(self):
         self.add_task(1, ["@alice"], title="Secret plan")
+        telegram_bot = self.make_bot(AsyncMock(return_value=SimpleNamespace(message_id=321)))
         update = self.make_update("!wme")
 
-        await self.send(update, AsyncMock(side_effect=BadRequest("Not enough rights")))
+        await self.send(update, telegram_bot)
 
+        telegram_bot.delete_message.assert_awaited_once_with(1, 321)
         reply = update.message.reply_text.await_args.args[0]
-        self.assertIn("Make me a group admin", reply)
+        self.assertIn("doesn't support private replies", reply)
         self.assertNotIn("Secret plan", reply)
+
+    async def test_wme_failure_messages_match_the_cause(self):
+        self.add_task(1, ["@alice"], title="Secret plan")
+        cases = (
+            (BadRequest("Not enough rights"), "member", "Make me a group admin"),
+            (Forbidden("Forbidden"), "left", "Make me a group admin"),
+            (BadRequest("Can't parse entities"), "administrator", "try <code>!wme</code> again later"),
+            (TimedOut(), "administrator", "didn't confirm"),
+            (RetryAfter(5), "administrator", "try <code>!wme</code> again later"),
+        )
+        for error, status, expected in cases:
+            with self.subTest(error=error, status=status):
+                update = self.make_update("!wme")
+                await self.send(update, self.make_bot(AsyncMock(side_effect=error), bot_status=status))
+                reply = update.message.reply_text.await_args.args[0]
+                self.assertIn(expected, reply)
+                self.assertNotIn("Secret plan", reply)
 
     async def test_wme_rejects_anonymous_admins(self):
         anonymous = self.make_update("!wme", anonymous=True)
-        send_message = await self.send(anonymous)
-        send_message.assert_not_awaited()
+        telegram_bot = await self.send(anonymous)
+        telegram_bot.send_message.assert_not_awaited()
         self.assertIn("anonymously", anonymous.message.reply_text.await_args.args[0])
 
-    def test_long_assignment_lists_drop_descriptions_then_truncate(self):
-        tasks = [
-            Task(i, 1, i, f"repo/{i}", f"https://github.com/o/repo/pull/{i}", ["@alice"], "@author", None,
-                 title="T" * 200, description="D" * 2000)
-            for i in range(1, 60)
-        ]
-        compact = assigned_reviews(tasks[:8])
-        self.assertNotIn("blockquote", compact)
-        self.assertEqual(compact.count("(by @author)"), 8)
-
-        truncated = assigned_reviews(tasks)
-        self.assertLessEqual(len(truncated), 4096)
-        self.assertIn("more. Use <code>!w</code> for the full queue.", truncated)
+    def test_visible_length_ignores_markup_and_counts_like_telegram(self):
+        self.assertEqual(visible_length('<a href="https://example.com/very/long">repo/1</a> &lt;b&gt;'), 10)
+        self.assertEqual(visible_length("👍"), 2)
 
     def test_existing_databases_gain_detail_columns(self):
         with tempfile.TemporaryDirectory() as temp_dir:

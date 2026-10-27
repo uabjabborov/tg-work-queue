@@ -6,13 +6,13 @@ from typing import Optional
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
-from telegram.constants import ChatType, ParseMode
-from telegram.error import TelegramError
+from telegram.constants import ChatMemberStatus, ChatType, ParseMode
+from telegram.error import BadRequest, Forbidden, TelegramError, TimedOut
 from html import escape as html_escape
 
 from database import Database, Task
 from leaderboard import build_leaderboard, format_leaderboard, reporting_week
-from presentation import assigned_reviews, review_heading, review_link, task_listing
+from presentation import assigned_reviews, review_heading, review_link, split_messages, task_listing
 from review_details import fetch_review_details, review_client
 from review_urls import normalize_review_number, parse_review_url
 from scheduler import add_reminder_job, remove_reminder_job, setup_scheduler
@@ -340,6 +340,10 @@ async def handle_wadd(update: Update, chat_id: int, url: str, assignees: list[st
         )
         return
     
+    if db.has_task(chat_id, task_id):
+        await update.message.reply_text(f"PR/MR reference {task_id} already exists in the queue.")
+        return
+
     async with review_client() as client:
         details = await fetch_review_details(client, url)
     title = details.title if details else None
@@ -368,8 +372,8 @@ async def handle_w(update: Update, chat_id: int) -> None:
         return
     
     await refresh_task_details([task for task in tasks if not task.title])
-    response = "\n".join(task_listing(task) for task in tasks)
-    await update.message.reply_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    for response in split_messages([task_listing(task) for task in tasks]):
+        await update.message.reply_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
 async def handle_wme(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
@@ -382,11 +386,12 @@ async def handle_wme(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id
 
     username = update.effective_user.username
     if not username:
-        await reply_privately(update, context, "Set a Telegram username to use <code>!wme</code>. Reviews are assigned by @username.")
+        await reply_privately(update, context, ["Set a Telegram username to use <code>!wme</code>. Reviews are assigned by @username."])
         return
 
-    mention = f"@{username}".lower()
-    tasks = [task for task in db.get_tasks(chat_id) if mention in (assignee.lower() for assignee in task.assignees)]
+    # A direct message has no queue of its own, so list assignments from every group.
+    in_private_chat = update.effective_chat.type == ChatType.PRIVATE
+    tasks = db.get_tasks_assigned_to(f"@{username}", None if in_private_chat else chat_id)
     # Fetch fresh titles and descriptions; the list is short and only the requester sees it.
     await refresh_task_details(tasks)
     await reply_privately(update, context, assigned_reviews(tasks))
@@ -404,24 +409,53 @@ async def refresh_task_details(tasks: list[Task]) -> None:
             db.update_task_details(task.id, details.title, details.description)
 
 
-async def reply_privately(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+async def reply_privately(update: Update, context: ContextTypes.DEFAULT_TYPE, texts: list[str]) -> None:
     """Reply so only the sender sees it; in private chats a normal reply is already private."""
     chat = update.effective_chat
     if chat.type == ChatType.PRIVATE:
-        await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        for text in texts:
+            await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         return
 
     # Ephemeral messages (Bot API 10.2+) are not wrapped by python-telegram-bot yet. Admin bots
     # may send them at any time; Telegram does not guarantee delivery to offline users.
-    try:
-        await context.bot.send_message(
-            chat.id, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
-            message_thread_id=update.message.message_thread_id if update.message.is_topic_message else None,
-            api_kwargs={"ephemeral_message_parameters": {"receiver_user_id": update.effective_user.id}},
-        )
-    except TelegramError as error:
-        logger.warning("Could not send ephemeral reply in chat %s: %s", chat.id, error)
-        await update.message.reply_text("I couldn't reply privately. Make me a group admin so I can send replies only you can see.")
+    for text in texts:
+        try:
+            sent = await context.bot.send_message(
+                chat.id, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+                message_thread_id=update.message.message_thread_id if update.message.is_topic_message else None,
+                api_kwargs={"ephemeral_message_parameters": {"receiver_user_id": update.effective_user.id}},
+            )
+        except TelegramError as error:
+            logger.warning("Could not send ephemeral reply in chat %s: %r", chat.id, error)
+            await update.message.reply_text(await private_reply_failure(context, chat.id, error),
+                                            parse_mode=ParseMode.HTML)
+            return
+
+        # The Bot API ignores parameters it doesn't know, so a server without ephemeral support
+        # would post publicly. Ephemeral messages are the only ones returned with message ID 0.
+        if sent.message_id != 0:
+            logger.error("Ephemeral reply in chat %s was posted publicly; deleting it", chat.id)
+            try:
+                await context.bot.delete_message(chat.id, sent.message_id)
+            except TelegramError:
+                logger.exception("Could not delete public reply %s in chat %s", sent.message_id, chat.id)
+            await update.message.reply_text("This Telegram server doesn't support private replies, so I can't show that here.")
+            return
+
+
+async def private_reply_failure(context: ContextTypes.DEFAULT_TYPE, chat_id: int, error: TelegramError) -> str:
+    """Explain a failed ephemeral reply without blaming admin rights unless they are the cause."""
+    if isinstance(error, TimedOut):
+        return "Telegram didn't confirm my private reply. If you didn't get it, send <code>!wme</code> again."
+    if isinstance(error, (BadRequest, Forbidden)):
+        try:
+            member = await context.bot.get_chat_member(chat_id, context.bot.id)
+        except TelegramError:
+            member = None
+        if member is not None and member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+            return "I couldn't reply privately. Make me a group admin so I can send replies only you can see."
+    return "I couldn't reply privately right now. Please try <code>!wme</code> again later."
 
 
 async def handle_wdone(update: Update, chat_id: int, task_ref: str) -> None:
@@ -489,7 +523,7 @@ Examples:
 List all tasks in the queue
 
 <code>!wme</code>
-Privately show reviews assigned to you, with descriptions. Only you see the reply.
+Privately show reviews assigned to you, with descriptions. Only you see the reply. In a direct message with the bot, lists your reviews from all groups.
 
 <code>!wdone &lt;PR/MR reference&gt;</code>
 Remove a completed task by PR/MR reference, URL, or unambiguous PR/MR number
@@ -733,7 +767,9 @@ def main() -> None:
         raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
     
     # Create application
-    application = Application.builder().token(token).post_init(post_init).post_stop(post_stop).build()
+    # Updates are handled concurrently so a slow PR/MR lookup doesn't stall other chats.
+    application = (Application.builder().token(token).post_init(post_init).post_stop(post_stop)
+                   .concurrent_updates(True).build())
     
     # Add message handler for all text messages
     application.add_handler(

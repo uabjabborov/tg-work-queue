@@ -1,8 +1,10 @@
 """Fetch PR/MR titles and descriptions from GitHub and the configured GitLab host."""
 
+import asyncio
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import quote, urlsplit
@@ -13,7 +15,10 @@ from review_urls import parse_review_url
 
 logger = logging.getLogger(__name__)
 
-REQUEST_TIMEOUT = 5.0
+# Upper bound for one lookup, including connecting; callers wait for it before replying.
+REQUEST_TIMEOUT = 4.0
+# Unreachable or private PRs are not retried on every listing.
+FAILURE_COOLDOWN = 15 * 60
 DESCRIPTION_LIMIT = 1000
 HTML_COMMENT_PATTERN = re.compile(r"<!--.*?-->", re.DOTALL)
 BLANK_LINES_PATTERN = re.compile(r"\n\s*\n\s*\n+")
@@ -23,6 +28,10 @@ BLANK_LINES_PATTERN = re.compile(r"\n\s*\n\s*\n+")
 class ReviewDetails:
     title: str
     description: str
+
+
+# API URL -> monotonic time of the last failed lookup.
+_recent_failures: dict[str, float] = {}
 
 
 def review_client() -> httpx.AsyncClient:
@@ -40,7 +49,8 @@ def _api_request(url: str) -> tuple[str, dict[str, str], str] | None:
     """Return the API URL, headers, and description field for a supported PR/MR link.
 
     Only github.com and the host in GITLAB_URL are contacted, so chat members cannot
-    point the bot at arbitrary servers or receive a token meant for another host.
+    point the bot at arbitrary servers or receive a token meant for another host. The GitHub
+    token is used only for owners in GITHUB_ORGS; anyone in the chat can read what it unlocks.
     """
     parsed = parse_review_url(url)
     if parsed is None:
@@ -49,7 +59,9 @@ def _api_request(url: str) -> tuple[str, dict[str, str], str] | None:
 
     if host == "github.com":
         headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
-        if token := os.getenv("GITHUB_TOKEN"):
+        owner = project.split("/")[1].lower()
+        allowed_owners = {org.strip().lower() for org in os.getenv("GITHUB_ORGS", "").split(",")}
+        if (token := os.getenv("GITHUB_TOKEN")) and owner in allowed_owners:
             headers["Authorization"] = f"Bearer {token}"
         return f"https://api.github.com/repos{project}/pulls/{number}", headers, "body"
 
@@ -69,14 +81,19 @@ async def fetch_review_details(client: httpx.AsyncClient, url: str) -> Optional[
     if request is None:
         return None
     api_url, headers, description_field = request
+    failed_at = _recent_failures.get(api_url)
+    if failed_at is not None and time.monotonic() - failed_at < FAILURE_COOLDOWN:
+        return None
     try:
-        response = await client.get(api_url, headers=headers)
+        response = await asyncio.wait_for(client.get(api_url, headers=headers), REQUEST_TIMEOUT)
         response.raise_for_status()
         data = response.json()
         title = (data.get("title") or "").strip()
-    except (httpx.HTTPError, ValueError, AttributeError) as error:
-        logger.warning("Could not fetch details for %s: %s", url, error)
+        if not title:
+            raise ValueError("response has no title")
+    except (httpx.HTTPError, asyncio.TimeoutError, ValueError, AttributeError) as error:
+        logger.warning("Could not fetch details for %s: %r", url, error)
+        _recent_failures[api_url] = time.monotonic()
         return None
-    if not title:
-        return None
+    _recent_failures.pop(api_url, None)
     return ReviewDetails(title=title, description=clean_description(data.get(description_field)))

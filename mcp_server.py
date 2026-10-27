@@ -38,7 +38,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 NOTE_LIMIT = 1000
-TITLE_LIMIT = 255
+TITLE_MAX_LENGTH = 255
 USERNAME_PATTERN = re.compile(r"@?(\w+)")
 
 
@@ -143,8 +143,8 @@ def create_server(db: Database, bot_token: str, chat_id: int) -> MCPServer:
         if len(note) > NOTE_LIMIT:
             raise ToolError(f"Note is too long ({len(note)} characters); the limit is {NOTE_LIMIT}.")
         title = " ".join((title or "").split())
-        if len(title) > TITLE_LIMIT:
-            raise ToolError(f"Title is too long ({len(title)} characters); the limit is {TITLE_LIMIT}.")
+        if len(title) > TITLE_MAX_LENGTH:
+            raise ToolError(f"Title is too long ({len(title)} characters); the limit is {TITLE_MAX_LENGTH}.")
         description = clean_description(description)
         if not title:
             # Agents usually know the title; otherwise try the bot's own lookup (e.g. public GitHub).
