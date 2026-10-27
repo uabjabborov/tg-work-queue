@@ -135,13 +135,13 @@ docker-compose down
 AI coding agents such as Claude Code, Codex, and Conductor can queue reviews through an [MCP](https://modelcontextprotocol.io) server. Ask the agent something like *"add my PR to the review queue for @alice and tell her to focus on the migration"*. The bot then posts this in the group:
 
 ```
-repo/45 → @alice (by @dave)
+repo/45 — Add order archiving → @alice (by @dave)
 ┃ Please focus on the migration in 0042_orders.py
 ```
 
 | Tool | Description |
 |------|-------------|
-| `add_review(url, reviewers?, note?)` | Same as `!wadd`. Optional `note` is posted as a quote for reviewers (up to 1000 characters) |
+| `add_review(url, reviewers?, note?, title?, description?)` | Same as `!wadd`. Optional `note` is posted as a quote for reviewers (up to 1000 characters). `title` and `description` come from the PR/MR, so they work even when the bot can't reach your GitLab |
 | `list_reviews()` | Same as `!w` |
 
 Telegram doesn't deliver one bot's messages to another bot, so the MCP server doesn't send `!wadd` text. Instead it adds reviews to the bot's database directly and posts the announcement through the Bot API.
@@ -350,7 +350,7 @@ Reminders use 5-part cron expressions in UTC timezone:
 
 ## PR/MR Titles
 
-When a PR/MR is added, the bot fetches its title and description and shows the title in `!w`, reminders, and command replies. Queue entries added before this feature get their title the next time `!w` or `!wme` runs. If a fetch fails (private repository without a token, network error, or unsupported host), the entry is shown as a link only.
+Each queue entry shows its PR/MR title in `!w`, reminders, and command replies, and its description in `!wme`. When a review is added through MCP, the agent passes the title and description, so this also works for GitLab servers the bot can't reach, such as ones behind a VPN. For `!wadd`, the bot fetches them from GitHub or the GitLab host in `GITLAB_URL`. Queue entries added before this feature get their title the next time `!w` or `!wme` runs. If a fetch fails (private repository without a token, network error, or unsupported host), the entry is shown as a link only.
 
 ## Notes
 

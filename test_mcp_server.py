@@ -7,6 +7,7 @@ from starlette.testclient import TestClient
 
 import mcp_server
 from database import Database
+from review_details import ReviewDetails
 
 CHAT_ID = -100
 HEADERS = {
@@ -27,6 +28,10 @@ class McpServerTests(unittest.TestCase):
         bot_patch = patch.object(mcp_server, "Bot", return_value=self.bot)
         bot_patch.start()
         self.addCleanup(bot_patch.stop)
+        self.fetch_details = AsyncMock(return_value=None)
+        fetch_patch = patch.object(mcp_server, "fetch_review_details", self.fetch_details)
+        fetch_patch.start()
+        self.addCleanup(fetch_patch.stop)
 
         server = mcp_server.create_server(self.db, "bot-token", CHAT_ID)
         app = mcp_server.build_app(server, {"secret": mcp_server.Submitter("@dave", 7)})
@@ -65,6 +70,37 @@ class McpServerTests(unittest.TestCase):
             "<blockquote>Check &lt;migrations&gt; &amp; tests</blockquote>"
         ))
 
+    def test_add_review_saves_title_and_description_from_the_agent(self):
+        is_error, _ = self.tool_result("add_review", {
+            "url": "https://gitlab.internal/team/repo/-/merge_requests/7",
+            "reviewers": ["@alice"],
+            "title": "  Fix <login>\n redirect ",
+            "description": "<!-- template -->\nRedirect after login.",
+        })
+
+        self.assertFalse(is_error)
+        self.fetch_details.assert_not_awaited()
+        [task] = self.db.get_tasks(CHAT_ID)
+        self.assertEqual((task.title, task.description), ("Fix <login> redirect", "Redirect after login."))
+        self.assertEqual(self.bot.send_message.await_args.args[1], (
+            '<a href="https://gitlab.internal/team/repo/-/merge_requests/7">repo/7</a>'
+            " — Fix &lt;login&gt; redirect → @alice (by @dave)"
+        ))
+        self.assertEqual(self.tool_result("list_reviews", {}), (False, (
+            "repo/7 https://gitlab.internal/team/repo/-/merge_requests/7 — Fix <login> redirect → @alice (by @dave)"
+        )))
+
+    def test_add_review_looks_up_missing_title(self):
+        self.fetch_details.return_value = ReviewDetails("Fetched title", "Fetched body")
+
+        self.tool_result("add_review", {"url": "https://github.com/owner/repo/pull/45"})
+        self.tool_result("add_review", {"url": "https://github.com/owner/repo/pull/46", "description": "Agent body"})
+
+        first, second = self.db.get_tasks(CHAT_ID)
+        self.assertEqual((first.title, first.description), ("Fetched title", "Fetched body"))
+        self.assertEqual((second.title, second.description), ("Fetched title", "Agent body"))
+        self.assertIn("</a> — Fetched title (by @dave)", self.bot.send_message.await_args.args[1])
+
     def test_add_review_reports_errors_the_agent_can_fix(self):
         self.tool_result("add_review", {"url": "https://github.com/owner/repo/pull/45"})
         cases = (
@@ -72,6 +108,7 @@ class McpServerTests(unittest.TestCase):
             ({"url": "https://github.com/owner/repo/issues/1"}, "Unsupported URL"),
             ({"url": "https://github.com/owner/repo/pull/46", "reviewers": ["not a name"]}, "Invalid reviewer"),
             ({"url": "https://github.com/owner/repo/pull/46", "note": "x" * 1001}, "Note is too long"),
+            ({"url": "https://github.com/owner/repo/pull/46", "title": "x" * 256}, "Title is too long"),
         )
         for arguments, error in cases:
             with self.subTest(error=error):

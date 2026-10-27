@@ -5,6 +5,7 @@ deliver one bot's messages to another, so tools write to the queue directly and 
 the result in the group through the Bot API instead of sending `!wadd` text.
 """
 
+import functools
 import hmac
 import logging
 import os
@@ -25,6 +26,7 @@ from telegram.constants import ParseMode
 
 from database import Database
 from presentation import review_listing
+from review_details import clean_description, fetch_review_details, review_client
 from review_urls import parse_review_url
 
 load_dotenv()
@@ -36,6 +38,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 NOTE_LIMIT = 1000
+TITLE_LIMIT = 255
 USERNAME_PATTERN = re.compile(r"@?(\w+)")
 
 
@@ -102,7 +105,9 @@ def create_server(db: Database, bot_token: str, chat_id: int) -> MCPServer:
         "work-queue",
         instructions=(
             "Manages the team's Telegram code review queue. Use add_review when the user asks to "
-            "queue a PR/MR for review, request a review, or run !wadd. Use list_reviews to see the queue."
+            "queue a PR/MR for review, request a review, or run !wadd. Always pass the PR/MR title and "
+            "description: the bot cannot reach private GitLab servers to look them up. "
+            "Use list_reviews to see the queue."
         ),
     )
 
@@ -113,13 +118,17 @@ def create_server(db: Database, bot_token: str, chat_id: int) -> MCPServer:
         await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
     @server.tool()
-    async def add_review(url: str, ctx: Context, reviewers: list[str] | None = None, note: str | None = None) -> str:
+    async def add_review(url: str, ctx: Context, reviewers: list[str] | None = None, note: str | None = None,
+                         title: str | None = None, description: str | None = None) -> str:
         """Add a GitHub pull request or GitLab merge request to the Telegram review queue, like `!wadd`.
 
         Args:
             url: Full PR/MR URL, e.g. https://github.com/owner/repo/pull/45
             reviewers: Telegram usernames to assign and mention, e.g. ["@alice", "@bob"]
             note: Optional message for reviewers, such as what changed or what to focus on
+            title: The PR/MR title exactly as on GitHub/GitLab. Always pass it; the bot may not be able
+                to reach the server to look it up.
+            description: The PR/MR description (body), as on GitHub/GitLab. Shown to assigned reviewers.
         """
         submitter: Submitter = ctx.request_context.request.state.submitter
         parsed = parse_review_url(url)
@@ -133,17 +142,28 @@ def create_server(db: Database, bot_token: str, chat_id: int) -> MCPServer:
         note = (note or "").strip()
         if len(note) > NOTE_LIMIT:
             raise ToolError(f"Note is too long ({len(note)} characters); the limit is {NOTE_LIMIT}.")
+        title = " ".join((title or "").split())
+        if len(title) > TITLE_LIMIT:
+            raise ToolError(f"Title is too long ({len(title)} characters); the limit is {TITLE_LIMIT}.")
+        description = clean_description(description)
+        if not title:
+            # Agents usually know the title; otherwise try the bot's own lookup (e.g. public GitHub).
+            async with review_client() as client:
+                details = await fetch_review_details(client, url)
+            if details:
+                title, description = details.title, description or details.description
 
         # SQLite may wait on the bot's write lock; keep the event loop free meanwhile.
-        seq_num = await anyio.to_thread.run_sync(
-            db.add_task, chat_id, task_id, url, assignees, submitter.name, submitter.user_id
-        )
+        seq_num = await anyio.to_thread.run_sync(functools.partial(
+            db.add_task, chat_id, task_id, url, assignees, submitter.name, submitter.user_id,
+            title=title or None, description=description or None,
+        ))
         if seq_num is None:
             raise ToolError(f"PR/MR reference {task_id} already exists in the queue.")
         logger.info(f"Added task {task_id} in chat {chat_id} via MCP for {submitter.name}: {url} -> "
                     f"{', '.join(assignees) or 'unassigned'}")
 
-        message = review_listing(task_id, url, assignees, submitter.name)
+        message = review_listing(task_id, url, assignees, submitter.name, title)
         if note:
             message += f"\n<blockquote>{html_escape(note)}</blockquote>"
         result = f"Added {task_id} to the review queue"
@@ -163,6 +183,7 @@ def create_server(db: Database, bot_token: str, chat_id: int) -> MCPServer:
             return "No reviews in the queue."
         return "\n".join(
             f"{task.task_id} {task.url}"
+            + (f" — {task.title}" if task.title else "")
             + (f" → {', '.join(task.assignees)}" if task.assignees else "")
             + f" (by {task.created_by})"
             for task in tasks
