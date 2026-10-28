@@ -1,3 +1,4 @@
+import asyncio
 import os
 import re
 import logging
@@ -5,12 +6,13 @@ from typing import Optional
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
-from telegram.constants import ParseMode
+from telegram.constants import ChatMemberStatus, ChatType, ParseMode
+from telegram.error import BadRequest, Forbidden, TelegramError, TimedOut
 from html import escape as html_escape
 
 from database import Database, Task
 from leaderboard import build_leaderboard, format_leaderboard, reporting_week
-from presentation import review_link, task_listing
+from presentation import assigned_reviews, review_link, task_listing
 from review_urls import normalize_review_number, parse_review_url
 from scheduler import add_reminder_job, remove_reminder_job, setup_scheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -33,6 +35,7 @@ WADD_PATTERN_WITH_USER = re.compile(r"^!wadd\s+(https?://\S+)\s+((?:@\w+\s*)+)$"
 WADD_PATTERN_NO_USER = re.compile(r"^!wadd\s+(https?://\S+)$", re.IGNORECASE)
 WADD_PREFIX = re.compile(r"^!wadd\b", re.IGNORECASE)
 W_PATTERN = re.compile(r"^!w$", re.IGNORECASE)
+WME_PATTERN = re.compile(r"^!wme$", re.IGNORECASE)
 WDONE_PATTERN = re.compile(r"^!wdone\s+(.+)$", re.IGNORECASE)
 WDONE_PREFIX = re.compile(r"^!wdone\b", re.IGNORECASE)
 WBOUNCE_PATTERN = re.compile(r"^!wbounce\s+(.+)$", re.IGNORECASE)
@@ -52,6 +55,8 @@ WLEADERBOARD_PREFIX = re.compile(r"^!wleaderboard\b", re.IGNORECASE)
 QUALIFIED_REFERENCE_PATTERN = re.compile(r"[^/\s]+/[0-9]+")
 NUMBER_PATTERN = re.compile(r"[0-9]+")
 LEGACY_REFERENCE_PATTERN = re.compile(r"#[0-9]+")
+
+MEMBER_STATUSES = (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER)
 
 REFERENCE_USAGE = "Use a PR/MR reference such as <code>repo/120</code>, its URL, or an unambiguous PR/MR number. Use <code>!w</code> to see current references."
 
@@ -210,6 +215,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if W_PATTERN.match(text):
         await handle_w(update, chat_id)
         return
+
+    if WME_PATTERN.match(text):
+        await handle_wme(update, context, chat_id)
+        return
     
     # Check for !wdone command
     wdone_match = WDONE_PATTERN.match(text)
@@ -350,6 +359,94 @@ async def handle_w(update: Update, chat_id: int) -> None:
     await update.message.reply_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
+async def handle_wme(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """Handle !wme command - privately show reviews assigned to the sender."""
+    user_id, _ = sender_identity(update)
+    if user_id is None:
+        # Private replies go to one user, so they need an identified sender.
+        await update.message.reply_text("<code>!wme</code> needs to know who you are. Send it from your own account, not anonymously.",
+                                        parse_mode=ParseMode.HTML)
+        return
+
+    username = update.effective_user.username
+    if not username:
+        await reply_privately(update, context, ["Set a Telegram username to use <code>!wme</code>. Reviews are assigned by @username."])
+        return
+
+    # A direct message has no queue of its own, so list assignments from every group the
+    # sender is still in. A matching @username alone could be a typo or a reclaimed name.
+    if update.effective_chat.type == ChatType.PRIVATE:
+        tasks = await tasks_in_member_groups(context, db.get_tasks_assigned_to(f"@{username}"), user_id)
+    else:
+        tasks = db.get_tasks_assigned_to(f"@{username}", chat_id)
+    await reply_privately(update, context, assigned_reviews(tasks))
+
+
+async def tasks_in_member_groups(context: ContextTypes.DEFAULT_TYPE, tasks: list[Task], user_id: int) -> list[Task]:
+    """Keep only tasks from chats the user currently belongs to."""
+    async def is_member(chat_id: int) -> bool:
+        try:
+            member = await context.bot.get_chat_member(chat_id, user_id)
+        except TelegramError:
+            return False
+        return member.status in MEMBER_STATUSES or (
+            member.status == ChatMemberStatus.RESTRICTED and getattr(member, "is_member", False)
+        )
+
+    chat_ids = list(dict.fromkeys(task.chat_id for task in tasks))
+    memberships = dict(zip(chat_ids, await asyncio.gather(*(is_member(chat_id) for chat_id in chat_ids))))
+    return [task for task in tasks if memberships[task.chat_id]]
+
+
+async def reply_privately(update: Update, context: ContextTypes.DEFAULT_TYPE, texts: list[str]) -> None:
+    """Reply so only the sender sees it; in private chats a normal reply is already private."""
+    chat = update.effective_chat
+    if chat.type == ChatType.PRIVATE:
+        for text in texts:
+            await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        return
+
+    # Ephemeral messages (Bot API 10.2+) are not wrapped by python-telegram-bot yet. Admin bots
+    # may send them at any time; Telegram does not guarantee delivery to offline users.
+    for text in texts:
+        try:
+            sent = await context.bot.send_message(
+                chat.id, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+                message_thread_id=update.message.message_thread_id if update.message.is_topic_message else None,
+                api_kwargs={"ephemeral_message_parameters": {"receiver_user_id": update.effective_user.id}},
+            )
+        except TelegramError as error:
+            logger.warning("Could not send ephemeral reply in chat %s: %r", chat.id, error)
+            await update.message.reply_text(await private_reply_failure(context, chat.id, error),
+                                            parse_mode=ParseMode.HTML)
+            return
+
+        # The Bot API ignores parameters it doesn't know, so a server without ephemeral support
+        # would post publicly. Ephemeral messages are the only ones returned with message ID 0.
+        if sent.message_id != 0:
+            logger.error("Ephemeral reply in chat %s was posted publicly; deleting it", chat.id)
+            try:
+                await context.bot.delete_message(chat.id, sent.message_id)
+            except TelegramError:
+                logger.exception("Could not delete public reply %s in chat %s", sent.message_id, chat.id)
+            await update.message.reply_text("This Telegram server doesn't support private replies, so I can't show that here.")
+            return
+
+
+async def private_reply_failure(context: ContextTypes.DEFAULT_TYPE, chat_id: int, error: TelegramError) -> str:
+    """Explain a failed ephemeral reply without blaming admin rights unless they are the cause."""
+    if isinstance(error, TimedOut):
+        return "Telegram didn't confirm my private reply. If you didn't get it, send the command again."
+    if isinstance(error, (BadRequest, Forbidden)):
+        try:
+            member = await context.bot.get_chat_member(chat_id, context.bot.id)
+        except TelegramError:
+            member = None
+        if member is not None and member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+            return "I couldn't reply privately. Make me a group admin so I can send replies only you can see."
+    return "I couldn't reply privately right now. Please try again later."
+
+
 async def handle_wdone(update: Update, chat_id: int, task_ref: str) -> None:
     """Handle !wdone command - remove a task by PR/MR reference."""
     await handle_remove_task(update, chat_id, task_ref, outcome="done")
@@ -413,6 +510,9 @@ Examples:
 
 <code>!w</code>
 List all tasks in the queue
+
+<code>!wme</code>
+Privately show reviews assigned to you (only you see the reply; the bot must be a group admin)
 
 <code>!wdone &lt;PR/MR reference&gt;</code>
 Remove a completed task by PR/MR reference, URL, or unambiguous PR/MR number

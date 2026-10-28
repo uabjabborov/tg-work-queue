@@ -10,6 +10,7 @@ A Telegram bot that manages task queues for GitLab/GitHub merge requests in chan
 |---------|-------------|
 | `!wadd <MR/PR URL> [@username ...]` | Add a merge request (optionally assign to one or more users) |
 | `!w` | List all tasks in the queue |
+| `!wme` | Privately show reviews assigned to you |
 | `!wdone <PR/MR reference>` | Remove a completed review |
 | `!wbounce <PR/MR reference>` | Remove a review with a "Changes required" comment in the chat |
 | `!wassign <PR/MR reference> @username [...]` | Assign or reassign a review (replaces all existing assignees) |
@@ -144,6 +145,13 @@ docker-compose down
 # monorepo/120 → @alice, @bob (by @dave)
 # backend/45 (by @dave)
 
+# Show reviews assigned to you (only you see the reply)
+!wme
+
+# Response (visible only to @alice):
+# Assigned to you (1)
+# monorepo/120 → @alice, @bob (by @dave)
+
 # Assign or reassign a task (replaces all existing assignees)
 !wassign monorepo/120 @eve
 # Or use the PR/MR URL:
@@ -249,10 +257,20 @@ Reminders use 5-part cron expressions in UTC timezone:
 - **Isolated Queues**: Each channel/group has its own independent task queue
 - **Unique Tasks**: PR/MR references are unique per channel (the same MR can't be added twice)
 - **Clickable Links**: Tasks are displayed as clickable links to the MR/PR
+- **Private Assignment View**: `!wme` replies with an ephemeral message only the sender can see
 - **Custom Reminders**: Each channel can configure its own reminder schedule
 - **Weekly Leaderboards**: Separate contributor and reviewer rankings and Monday recaps for each chat
 - **Persistent Storage**: Data is stored in SQLite database (`workqueue.db`)
 - **Flexible Assignment**: Reassign tasks at any time, replacing all existing assignees
+
+## Private Replies (`!wme`)
+
+`!wme` lists the reviews in the current chat whose assignees include your `@username`. Matching ignores case. Long lists are split across several messages.
+
+- In groups the reply is a Telegram [ephemeral message](https://core.telegram.org/bots/api#ephemeral-messages-and-commands) (Bot API 10.2+): only you and the bot see it. Telegram may drop it if you are offline or after an app restart, so just send `!wme` again.
+- The bot must be a group **admin** to send ephemeral messages. Otherwise it replies with a short notice instead of posting your list publicly. If Telegram ever posts the reply publicly (for example, a self-hosted Bot API server without ephemeral support), the bot deletes it immediately.
+- Your `!wme` message itself stays visible to the group; only the reply is private.
+- In a direct message with the bot, `!wme` lists your reviews from all groups you're still a member of, as a normal reply.
 
 ## Notes
 
