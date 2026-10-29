@@ -149,6 +149,11 @@ class Database:
                 CREATE INDEX IF NOT EXISTS review_activity_chat_time
                 ON review_activity (chat_id, completed_at)
             """)
+            # Lets !wme find each review's latest outcome without scanning a chat's whole history.
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS review_activity_identity
+                ON review_activity (chat_id, review_host, review_project, review_number, completed_at)
+            """)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS leaderboard_users (
                     chat_id INTEGER NOT NULL,
@@ -336,16 +341,17 @@ class Database:
             )
             return [self._row_to_task(conn, row) for row in cursor.fetchall()]
 
-    def get_bounced_reviews(self, user_id: Optional[int], name: Optional[str],
+    def get_bounced_reviews(self, user_id: Optional[int], name: Optional[str], since: datetime,
                             chat_id: Optional[int] = None) -> list[BouncedReview]:
-        """Reviews this user submitted whose latest outcome is a bounce and that aren't queued again.
+        """Reviews this user submitted that were bounced after `since`, weren't completed or bounced
+        again later, and aren't queued again.
 
         Submitters are matched by user ID; entries saved before IDs were recorded match by name.
         """
         with self._get_connection() as conn:
             rows = conn.execute("""
                 SELECT * FROM review_activity AS activity
-                WHERE outcome = 'bounce' AND review_host IS NOT NULL
+                WHERE outcome = 'bounce' AND review_host IS NOT NULL AND completed_at >= ?
                   AND (? IS NULL OR chat_id = ?)
                   AND (created_by_id = ? OR (created_by_id IS NULL AND LOWER(created_by) = LOWER(?)))
                   AND NOT EXISTS (
@@ -358,12 +364,17 @@ class Database:
                              OR (later.completed_at = activity.completed_at AND later.id > activity.id))
                   )
                 ORDER BY chat_id, completed_at, id
-            """, (chat_id, chat_id, user_id, name)).fetchall()
+            """, (utc_timestamp(since), chat_id, chat_id, user_id, name)).fetchall()
+            if not rows:
+                return []
+            # Queue entries only store URLs, so compare identities in Python, for the affected chats only.
+            chat_ids = sorted({row["chat_id"] for row in rows})
             queued = {
-                (row["chat_id"], parsed[1])
-                for row in conn.execute("SELECT chat_id, url FROM tasks WHERE (? IS NULL OR chat_id = ?)",
-                                        (chat_id, chat_id))
-                if (parsed := parse_review_url(row["url"]))
+                (task["chat_id"], parsed[1])
+                for task in conn.execute(
+                    f"SELECT chat_id, url FROM tasks WHERE chat_id IN ({', '.join('?' * len(chat_ids))})", chat_ids
+                )
+                if (parsed := parse_review_url(task["url"]))
             }
             return [
                 BouncedReview(row["chat_id"], row["task_id"], row["url"], row["completed_by"],

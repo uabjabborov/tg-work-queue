@@ -154,7 +154,7 @@ docker-compose down
 #
 # Your PRs/MRs that need changes (1)
 # backend/52 — bounced by @bob on Oct 28
-# Re-add one with !wadd once it's fixed.
+# Re-add one with !wadd once it's fixed. Bounces older than 14 days are hidden.
 
 # Assign or reassign a task (replaces all existing assignees)
 !wassign monorepo/120 @eve
@@ -271,12 +271,12 @@ Reminders use 5-part cron expressions in UTC timezone:
 
 `!wme` lists the reviews in the current chat whose assignees include your `@username`. Matching ignores case. Long lists are split across several messages.
 
-It also lists the PRs/MRs you added that a reviewer bounced with `!wbounce`, with who bounced them and when (Asia/Tashkent date). A bounced PR/MR stays on your list until it's added to the queue again with `!wadd`, so re-add it once the changes are made. If it's bounced again later, it comes back. Bounces are matched to you by your Telegram account, so they appear even without a username. Bounces from before this feature are included too.
+It also lists the PRs/MRs you added that a reviewer bounced with `!wbounce`, with who bounced them and when (Asia/Tashkent date). A bounced PR/MR stays on your list until it's added to the queue again with `!wadd`, so re-add it once the changes are made. If it's bounced again later, it comes back. Bounces older than 14 days are hidden, since the PR/MR was probably closed or replaced. Bounces are matched to you by your Telegram account, so they appear even without a username.
 
 - In groups the reply is a Telegram [ephemeral message](https://core.telegram.org/bots/api#ephemeral-messages-and-commands) (Bot API 10.2+): only you and the bot see it. Telegram may drop it if you are offline or after an app restart, so just send `!wme` again.
 - The bot must be a group **admin** to send ephemeral messages. Otherwise it replies with a short notice instead of posting your list publicly. If Telegram ever posts the reply publicly (for example, a self-hosted Bot API server without ephemeral support), the bot deletes it immediately.
 - Your `!wme` message itself stays visible to the group; only the reply is private.
-- In a direct message with the bot, `!wme` lists your reviews from all groups you're still a member of, as a normal reply.
+- In a direct message with the bot, `!wme` lists your reviews from all groups you're still a member of, as a normal reply, under each group's name. If Telegram can't confirm your membership in a group right now (for example, a timeout), the reply says so and you can send `!wme` again.
 
 ## Notes
 

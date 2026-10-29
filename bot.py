@@ -2,6 +2,7 @@ import asyncio
 import os
 import re
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from dotenv import load_dotenv
 from telegram import Update
@@ -12,7 +13,7 @@ from html import escape as html_escape
 
 from database import Database, Task
 from leaderboard import build_leaderboard, format_leaderboard, reporting_week
-from presentation import my_reviews, review_link, task_listing
+from presentation import BOUNCE_VISIBLE_DAYS, my_reviews, review_link, task_listing
 from review_urls import normalize_review_number, parse_review_url
 from scheduler import add_reminder_job, remove_reminder_job, setup_scheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -57,6 +58,8 @@ NUMBER_PATTERN = re.compile(r"[0-9]+")
 LEGACY_REFERENCE_PATTERN = re.compile(r"#[0-9]+")
 
 MEMBER_STATUSES = (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER)
+# Telegram rate-limits bursts of requests, so check a user's groups a few at a time.
+MEMBERSHIP_CHECK_CONCURRENCY = 5
 
 REFERENCE_USAGE = "Use a PR/MR reference such as <code>repo/120</code>, its URL, or an unambiguous PR/MR number. Use <code>!w</code> to see current references."
 
@@ -370,32 +373,58 @@ async def handle_wme(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id
 
     username = update.effective_user.username
     name = f"@{username}" if username else None
-    # A direct message has no queue of its own, so look across every group.
-    scope = None if update.effective_chat.type == ChatType.PRIVATE else chat_id
-    assigned = db.get_tasks_assigned_to(name, scope) if name else []
-    bounced = db.get_bounced_reviews(user_id, name, scope)
-    if scope is None:
-        # Only show groups the sender is still in: a matching @username alone could be a typo or a reclaimed name.
-        member_chats = await member_chat_ids(context, {item.chat_id for item in [*assigned, *bounced]}, user_id)
-        assigned = [task for task in assigned if task.chat_id in member_chats]
-        bounced = [review for review in bounced if review.chat_id in member_chats]
-    await reply_privately(update, context, my_reviews(assigned, bounced, has_username=bool(username)))
+    since = datetime.now(timezone.utc) - timedelta(days=BOUNCE_VISIBLE_DAYS)
+    if update.effective_chat.type != ChatType.PRIVATE:
+        assigned = db.get_tasks_assigned_to(name, chat_id) if name else []
+        bounced = db.get_bounced_reviews(user_id, name, since, chat_id)
+        await reply_privately(update, context, my_reviews(assigned, bounced, has_username=bool(username)))
+        return
+
+    # A direct message has no queue of its own, so look across every chat, but only show groups
+    # the sender is still in: a matching @username alone could be a typo or a reclaimed name.
+    assigned = db.get_tasks_assigned_to(name) if name else []
+    bounced = db.get_bounced_reviews(user_id, name, since)
+    other_chats = {item.chat_id for item in [*assigned, *bounced]} - {chat_id}
+    chat_titles, unchecked = await member_chat_titles(context, other_chats, user_id)
+    # Reviews queued in this direct message belong to the sender already.
+    chat_titles[chat_id] = "This chat"
+    assigned = [task for task in assigned if task.chat_id in chat_titles]
+    bounced = [review for review in bounced if review.chat_id in chat_titles]
+    await reply_privately(update, context, my_reviews(assigned, bounced, has_username=bool(username),
+                                                      chat_titles=chat_titles, unchecked_chats=unchecked))
 
 
-async def member_chat_ids(context: ContextTypes.DEFAULT_TYPE, chat_ids: set[int], user_id: int) -> set[int]:
-    """Return the chats the user currently belongs to."""
-    async def is_member(chat_id: int) -> bool:
-        try:
-            member = await context.bot.get_chat_member(chat_id, user_id)
-        except TelegramError:
-            return False
-        return member.status in MEMBER_STATUSES or (
-            member.status == ChatMemberStatus.RESTRICTED and getattr(member, "is_member", False)
-        )
+async def member_chat_titles(context: ContextTypes.DEFAULT_TYPE, chat_ids: set[int],
+                             user_id: int) -> tuple[dict[int, str], int]:
+    """Return the titles of the chats the user currently belongs to, and how many couldn't be checked."""
+    limit = asyncio.Semaphore(MEMBERSHIP_CHECK_CONCURRENCY)
+
+    async def check(chat_id: int) -> bool | None:
+        async with limit:
+            try:
+                member = await context.bot.get_chat_member(chat_id, user_id)
+            except (BadRequest, Forbidden):
+                # The user or the bot is no longer in the chat, or the chat is gone.
+                return False
+            except TelegramError as error:
+                logger.warning("Could not check membership of chat %s: %r", chat_id, error)
+                return None
+            return member.status in MEMBER_STATUSES or (
+                member.status == ChatMemberStatus.RESTRICTED and getattr(member, "is_member", False)
+            )
+
+    async def title(chat_id: int) -> str:
+        async with limit:
+            try:
+                return (await context.bot.get_chat(chat_id)).title or f"Chat {chat_id}"
+            except TelegramError:
+                return f"Chat {chat_id}"
 
     chat_ids = list(chat_ids)
-    memberships = await asyncio.gather(*(is_member(chat_id) for chat_id in chat_ids))
-    return {chat_id for chat_id, is_in in zip(chat_ids, memberships) if is_in}
+    results = dict(zip(chat_ids, await asyncio.gather(*(check(chat_id) for chat_id in chat_ids))))
+    member_chats = [chat_id for chat_id in chat_ids if results[chat_id]]
+    titles = dict(zip(member_chats, await asyncio.gather(*(title(chat_id) for chat_id in member_chats))))
+    return titles, sum(1 for result in results.values() if result is None)
 
 
 async def reply_privately(update: Update, context: ContextTypes.DEFAULT_TYPE, texts: list[str]) -> None:
@@ -408,7 +437,8 @@ async def reply_privately(update: Update, context: ContextTypes.DEFAULT_TYPE, te
 
     # Ephemeral messages (Bot API 10.2+) are not wrapped by python-telegram-bot yet. Admin bots
     # may send them at any time; Telegram does not guarantee delivery to offline users.
-    for text in texts:
+    for index, text in enumerate(texts):
+        partial = "Only part of my reply reached you. " if index else ""
         try:
             sent = await context.bot.send_message(
                 chat.id, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
@@ -417,7 +447,7 @@ async def reply_privately(update: Update, context: ContextTypes.DEFAULT_TYPE, te
             )
         except TelegramError as error:
             logger.warning("Could not send ephemeral reply in chat %s: %r", chat.id, error)
-            await update.message.reply_text(await private_reply_failure(context, chat.id, error),
+            await update.message.reply_text(partial + await private_reply_failure(context, chat.id, error),
                                             parse_mode=ParseMode.HTML)
             return
 
@@ -425,11 +455,13 @@ async def reply_privately(update: Update, context: ContextTypes.DEFAULT_TYPE, te
         # would post publicly. Ephemeral messages are the only ones returned with message ID 0.
         if sent.message_id != 0:
             logger.error("Ephemeral reply in chat %s was posted publicly; deleting it", chat.id)
+            notice = "This Telegram server doesn't support private replies, so I can't show that here."
             try:
                 await context.bot.delete_message(chat.id, sent.message_id)
             except TelegramError:
                 logger.exception("Could not delete public reply %s in chat %s", sent.message_id, chat.id)
-            await update.message.reply_text("This Telegram server doesn't support private replies, so I can't show that here.")
+                notice += " My reply was posted publicly and I couldn't delete it, so please delete it."
+            await update.message.reply_text(partial + notice)
             return
 
 

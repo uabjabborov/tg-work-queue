@@ -1,7 +1,8 @@
 import sqlite3
+import asyncio
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call, patch
@@ -9,6 +10,7 @@ from unittest.mock import AsyncMock, call, patch
 from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut
 
 from database import Database
+from leaderboard import TASHKENT
 from presentation import visible_length
 from scheduler import send_reminder
 
@@ -271,6 +273,7 @@ class WmeCommandTests(unittest.IsolatedAsyncioTestCase):
             send_message=send_message or AsyncMock(return_value=SimpleNamespace(message_id=0)),
             delete_message=AsyncMock(),
             get_chat_member=AsyncMock(side_effect=chat_member),
+            get_chat=AsyncMock(side_effect=lambda chat_id: SimpleNamespace(title=f"Team {chat_id}")),
         )
 
     async def send(self, update, telegram_bot=None):
@@ -426,20 +429,25 @@ class WmeCommandTests(unittest.IsolatedAsyncioTestCase):
         await self.command("!wdone 5", username="bob", user_id=8)
         self.assertNotIn("need changes", await self.wme_reply())
 
+    def bounce(self, number, bounced_at, created_by="@alice", created_by_id=7, chat_id=1):
+        self.add_task(number, ["@bob"], chat_id=chat_id)
+        task = self.db.get_tasks(chat_id)[-1]
+        with sqlite3.connect(self.db.db_path) as conn:
+            conn.execute("UPDATE tasks SET created_by = ?, created_by_id = ? WHERE id = ?",
+                         (created_by, created_by_id, task.id))
+        self.db.complete_task(chat_id, task.id, "bounce", "@bob", 8, completed_at=bounced_at)
+
     async def test_bounced_reviews_match_by_user_id_or_legacy_name(self):
-        bounced_at = datetime(2026, 10, 27, 20, 30, tzinfo=timezone.utc)
+        # 20:30 UTC is 01:30 the next day in Tashkent.
+        bounced_at = (datetime.now(timezone.utc) - timedelta(days=3)).replace(hour=20, minute=30)
         for number, created_by, created_by_id in ((1, "@old_name", 7), (2, "@Alice", None), (3, "@alice", 9)):
-            self.add_task(number, ["@bob"])
-            task = self.db.get_tasks(1)[-1]
-            with sqlite3.connect(self.db.db_path) as conn:
-                conn.execute("UPDATE tasks SET created_by = ?, created_by_id = ? WHERE id = ?",
-                             (created_by, created_by_id, task.id))
-            self.db.complete_task(1, task.id, "bounce", "@bob", 8, completed_at=bounced_at)
+            self.bounce(number, bounced_at, created_by, created_by_id)
 
         reply = await self.wme_reply()
 
         self.assertIn("need changes (2)", reply)
-        self.assertIn(">repo/1</a> — bounced by @bob on Oct 28", reply)  # 01:30 in Tashkent
+        tashkent_date = (bounced_at + timedelta(days=1)).strftime("%b %d")
+        self.assertIn(f">repo/1</a> — bounced by @bob on {tashkent_date}", reply)
         self.assertIn(">repo/2</a>", reply)
         self.assertNotIn(">repo/3</a>", reply)
 
@@ -463,6 +471,111 @@ class WmeCommandTests(unittest.IsolatedAsyncioTestCase):
         telegram_bot.get_chat_member.assert_has_awaits([call(-100, 7), call(-300, 7)], any_order=True)
         reply = update.message.reply_text.await_args.args[0]
         self.assertIn("need changes (1)", reply)
+
+    async def test_bounces_older_than_the_visible_window_are_hidden(self):
+        now = datetime.now(timezone.utc)
+        self.bounce(1, now - timedelta(days=bot.BOUNCE_VISIBLE_DAYS, hours=1))
+        self.bounce(2, now - timedelta(days=bot.BOUNCE_VISIBLE_DAYS - 1))
+
+        reply = await self.wme_reply()
+
+        self.assertIn("need changes (1)", reply)
+        self.assertIn(">repo/2</a>", reply)
+        self.assertNotIn(">repo/1</a>", reply)
+        self.assertIn(f"older than {bot.BOUNCE_VISIBLE_DAYS} days are hidden", reply)
+
+    async def test_wme_in_private_chat_names_each_group_and_includes_this_chat(self):
+        now = datetime.now(timezone.utc)
+        self.add_task(45, ["@alice"], chat_id=-100)
+        self.add_task(45, ["@alice"], chat_id=-200)
+        self.add_task(46, ["@alice"], chat_id=7)
+        self.bounce(52, now, chat_id=-200)
+        update = self.make_update("!wme", chat_type="private", chat_id=7)
+
+        telegram_bot = await self.send(update)
+
+        self.assertNotIn(7, [call.args[0] for call in telegram_bot.get_chat_member.await_args_list])
+        reply = update.message.reply_text.await_args.args[0]
+        self.assertEqual(reply, (
+            "<b>Assigned to you (3)</b>\n"
+            "<i>Team -200</i>\n"
+            '<a href="https://github.com/owner/repo/pull/45">repo/45</a> → @alice (by @author)\n'
+            "<i>Team -100</i>\n"
+            '<a href="https://github.com/owner/repo/pull/45">repo/45</a> → @alice (by @author)\n'
+            "<i>This chat</i>\n"
+            '<a href="https://github.com/owner/repo/pull/46">repo/46</a> → @alice (by @author)\n'
+            "\n<b>Your PRs/MRs that need changes (1)</b>\n"
+            "<i>Team -200</i>\n"
+            f'<a href="https://github.com/owner/repo/pull/52">repo/52</a> — bounced by @bob on '
+            f'{now.astimezone(TASHKENT).strftime("%b %d")}\n'
+            "<i>Re-add one with <code>!wadd</code> once it's fixed. Bounces older than 14 days are hidden.</i>"
+        ))
+
+    async def test_wme_in_private_chat_warns_when_groups_could_not_be_checked(self):
+        for chat_id in (-100, -200, -300, -400):
+            self.add_task(1, ["@alice"], chat_id=chat_id)
+        statuses = {-200: TimedOut(), -300: RetryAfter(5), -400: Forbidden("bot was kicked")}
+        update = self.make_update("!wme", chat_type="private", chat_id=7)
+
+        await self.send(update, self.make_bot(member_statuses=statuses))
+
+        reply = update.message.reply_text.await_args.args[0]
+        self.assertIn("Assigned to you (1)", reply)
+        self.assertIn("Team -100", reply)
+        self.assertIn("couldn't check 2 of your groups", reply)
+
+    async def test_wme_in_private_chat_limits_concurrent_membership_checks(self):
+        for chat_id in range(-120, -100):
+            self.add_task(1, ["@alice"], chat_id=chat_id)
+        active = peak = 0
+
+        async def chat_member(chat_id, user_id):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0)
+            active -= 1
+            return SimpleNamespace(status="member")
+
+        telegram_bot = self.make_bot()
+        telegram_bot.get_chat_member = AsyncMock(side_effect=chat_member)
+        update = self.make_update("!wme", chat_type="private", chat_id=7)
+
+        await self.send(update, telegram_bot)
+
+        self.assertEqual(telegram_bot.get_chat_member.await_count, 20)
+        self.assertLessEqual(peak, bot.MEMBERSHIP_CHECK_CONCURRENCY)
+        self.assertIn("Assigned to you (20)", update.message.reply_text.await_args.args[0])
+
+    async def test_wme_reports_a_partially_delivered_reply(self):
+        for number in range(1, 301):
+            self.add_task(number, ["@alice", "@" + "b" * 30])
+        send_message = AsyncMock(side_effect=[SimpleNamespace(message_id=0), TimedOut()])
+        update = self.make_update("!wme")
+
+        await self.send(update, self.make_bot(send_message))
+
+        reply = update.message.reply_text.await_args.args[0]
+        self.assertTrue(reply.startswith("Only part of my reply reached you."))
+
+    async def test_wme_asks_to_delete_a_public_reply_it_could_not_delete(self):
+        self.add_task(1, ["@alice"])
+        telegram_bot = self.make_bot(AsyncMock(return_value=SimpleNamespace(message_id=321)))
+        telegram_bot.delete_message = AsyncMock(side_effect=BadRequest("Message can't be deleted"))
+        update = self.make_update("!wme")
+
+        await self.send(update, telegram_bot)
+
+        self.assertIn("couldn't delete it, so please delete it", update.message.reply_text.await_args.args[0])
+
+    def test_bounce_lookup_has_an_identity_index(self):
+        with sqlite3.connect(self.db.db_path) as conn:
+            plan = " ".join(row[3] for row in conn.execute("""
+                EXPLAIN QUERY PLAN SELECT 1 FROM review_activity
+                WHERE chat_id = 1 AND review_host = 'h' AND review_project = 'p' AND review_number = '1'
+                  AND completed_at > ''
+            """))
+        self.assertIn("review_activity_identity", plan)
 
     def test_visible_length_ignores_markup_and_counts_like_telegram(self):
         self.assertEqual(visible_length('<a href="https://example.com/very/long">repo/1</a> &lt;b&gt;'), 10)
