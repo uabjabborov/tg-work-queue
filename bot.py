@@ -1,16 +1,19 @@
+import asyncio
 import os
 import re
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
-from telegram.constants import ParseMode
+from telegram.constants import ChatMemberStatus, ChatType, ParseMode
+from telegram.error import BadRequest, Forbidden, TelegramError, TimedOut
 from html import escape as html_escape
 
 from database import Database, Task
 from leaderboard import build_leaderboard, format_leaderboard, reporting_week
-from presentation import review_link, task_listing
+from presentation import FINISHED_VISIBLE_DAYS, my_reviews, review_link, task_listing
 from review_urls import normalize_review_number, parse_review_url
 from scheduler import add_reminder_job, remove_reminder_job, setup_scheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -33,6 +36,9 @@ WADD_PATTERN_WITH_USER = re.compile(r"^!wadd\s+(https?://\S+)\s+((?:@\w+\s*)+)$"
 WADD_PATTERN_NO_USER = re.compile(r"^!wadd\s+(https?://\S+)$", re.IGNORECASE)
 WADD_PREFIX = re.compile(r"^!wadd\b", re.IGNORECASE)
 W_PATTERN = re.compile(r"^!w$", re.IGNORECASE)
+WME_PATTERN = re.compile(r"^!wme$", re.IGNORECASE)
+WMERGED_PATTERN = re.compile(r"^!wmerged\s+(.+)$", re.IGNORECASE)
+WMERGED_PREFIX = re.compile(r"^!wmerged\b", re.IGNORECASE)
 WDONE_PATTERN = re.compile(r"^!wdone\s+(.+)$", re.IGNORECASE)
 WDONE_PREFIX = re.compile(r"^!wdone\b", re.IGNORECASE)
 WBOUNCE_PATTERN = re.compile(r"^!wbounce\s+(.+)$", re.IGNORECASE)
@@ -52,6 +58,10 @@ WLEADERBOARD_PREFIX = re.compile(r"^!wleaderboard\b", re.IGNORECASE)
 QUALIFIED_REFERENCE_PATTERN = re.compile(r"[^/\s]+/[0-9]+")
 NUMBER_PATTERN = re.compile(r"[0-9]+")
 LEGACY_REFERENCE_PATTERN = re.compile(r"#[0-9]+")
+
+MEMBER_STATUSES = (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER)
+# Telegram rate-limits bursts of requests, so check a user's groups a few at a time.
+MEMBERSHIP_CHECK_CONCURRENCY = 5
 
 REFERENCE_USAGE = "Use a PR/MR reference such as <code>repo/120</code>, its URL, or an unambiguous PR/MR number. Use <code>!w</code> to see current references."
 
@@ -138,28 +148,31 @@ def extract_task_id(url: str) -> str | None:
     return parsed[0] if parsed else None
 
 
+def matching_reviews(reviews: list, task_ref: str) -> list | None:
+    """Reviews (anything with task_id and url) matching a PR/MR reference, or None if it isn't one."""
+    if NUMBER_PATTERN.fullmatch(task_ref):
+        number = normalize_review_number(task_ref)
+        return [
+            review for review in reviews
+            if NUMBER_PATTERN.fullmatch(review.task_id.rsplit("/", 1)[-1])
+            and normalize_review_number(review.task_id.rsplit("/", 1)[-1]) == number
+        ]
+    if QUALIFIED_REFERENCE_PATTERN.fullmatch(task_ref):
+        return [review for review in reviews if review.task_id == task_ref]
+    parsed = parse_review_url(task_ref)
+    if parsed is None:
+        return None
+    return [review for review in reviews if (saved := parse_review_url(review.url)) and saved[1] == parsed[1]]
+
+
 def resolve_task_reference(chat_id: int, task_ref: str) -> tuple[Task | None, str | None]:
     """Find one task in this chat, or explain why the reference cannot be used."""
     if LEGACY_REFERENCE_PATTERN.fullmatch(task_ref):
         return None, f"Queue numbers such as <code>{html_escape(task_ref)}</code> are no longer supported. {REFERENCE_USAGE}"
 
-    tasks = db.get_tasks(chat_id)
-    if NUMBER_PATTERN.fullmatch(task_ref):
-        number = normalize_review_number(task_ref)
-        matches = [
-            task for task in tasks
-            if NUMBER_PATTERN.fullmatch(task.task_id.rsplit("/", 1)[-1])
-            and normalize_review_number(task.task_id.rsplit("/", 1)[-1]) == number
-        ]
-    elif QUALIFIED_REFERENCE_PATTERN.fullmatch(task_ref):
-        matches = [task for task in tasks if task.task_id == task_ref]
-    else:
-        parsed = parse_review_url(task_ref)
-        if parsed is None:
-            return None, f"Invalid PR/MR reference <code>{html_escape(task_ref)}</code>. {REFERENCE_USAGE}"
-        url_identity = parsed[1]
-        matches = [task for task in tasks if (saved := parse_review_url(task.url)) and saved[1] == url_identity]
-
+    matches = matching_reviews(db.get_tasks(chat_id), task_ref)
+    if matches is None:
+        return None, f"Invalid PR/MR reference <code>{html_escape(task_ref)}</code>. {REFERENCE_USAGE}"
     if len(matches) == 1:
         return matches[0], None
     if len(matches) > 1:
@@ -209,6 +222,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Check for !w command
     if W_PATTERN.match(text):
         await handle_w(update, chat_id)
+        return
+
+    if WME_PATTERN.match(text):
+        await handle_wme(update, context, chat_id)
+        return
+
+    wmerged_match = WMERGED_PATTERN.match(text)
+    if wmerged_match:
+        await handle_wmerged(update, chat_id, wmerged_match.group(1).strip())
+        return
+    elif WMERGED_PREFIX.match(text):
+        await update.message.reply_text(
+            "Usage: <code>!wmerged &lt;PR/MR reference&gt;</code>\n"
+            "Mark one of your approved PRs/MRs as merged, so it leaves <code>!wme</code>.\n"
+            "Examples: <code>!wmerged repo/123</code>, <code>!wmerged 123</code>, or <code>!wmerged https://github.com/owner/repo/pull/123</code>",
+            parse_mode=ParseMode.HTML
+        )
         return
     
     # Check for !wdone command
@@ -350,6 +380,160 @@ async def handle_w(update: Update, chat_id: int) -> None:
     await update.message.reply_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
+async def handle_wme(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """Handle !wme command - privately show reviews assigned to the sender and their approved or bounced PRs/MRs."""
+    user_id, _ = sender_identity(update)
+    if user_id is None:
+        # Private replies go to one user, so they need an identified sender.
+        await update.message.reply_text("<code>!wme</code> needs to know who you are. Send it from your own account, not anonymously.",
+                                        parse_mode=ParseMode.HTML)
+        return
+
+    username = update.effective_user.username
+    name = f"@{username}" if username else None
+    since = datetime.now(timezone.utc) - timedelta(days=FINISHED_VISIBLE_DAYS)
+    if update.effective_chat.type != ChatType.PRIVATE:
+        assigned = db.get_tasks_assigned_to(name, chat_id) if name else []
+        finished = db.get_finished_reviews(user_id, name, since, chat_id)
+        await reply_privately(update, context, my_reviews(assigned, finished, has_username=bool(username)))
+        return
+
+    # A direct message has no queue of its own, so look across every chat, but only show groups
+    # the sender is still in: a matching @username alone could be a typo or a reclaimed name.
+    assigned = db.get_tasks_assigned_to(name) if name else []
+    finished = db.get_finished_reviews(user_id, name, since)
+    other_chats = {item.chat_id for item in [*assigned, *finished]} - {chat_id}
+    chat_titles, unchecked = await member_chat_titles(context, other_chats, user_id)
+    # Reviews queued in this direct message belong to the sender already.
+    chat_titles[chat_id] = "This chat"
+    assigned = [task for task in assigned if task.chat_id in chat_titles]
+    finished = [review for review in finished if review.chat_id in chat_titles]
+    await reply_privately(update, context, my_reviews(assigned, finished, has_username=bool(username),
+                                                      chat_titles=chat_titles, unchecked_chats=unchecked))
+
+
+async def handle_wmerged(update: Update, chat_id: int, task_ref: str) -> None:
+    """Handle !wmerged command - take one of the sender's approved PRs/MRs off their !wme list."""
+    user_id, name = sender_identity(update)
+    if user_id is None:
+        await update.message.reply_text("<code>!wmerged</code> needs to know who you are. Send it from your own account, not anonymously.",
+                                        parse_mode=ParseMode.HTML)
+        return
+
+    username = update.effective_user.username
+    since = datetime.now(timezone.utc) - timedelta(days=FINISHED_VISIBLE_DAYS)
+    approved = [review for review in db.get_finished_reviews(user_id, f"@{username}" if username else None, since, chat_id)
+                if review.outcome == "done"]
+    matches = matching_reviews(approved, task_ref)
+    if matches is None:
+        await update.message.reply_text(
+            f"Invalid PR/MR reference <code>{html_escape(task_ref)}</code>. Use a reference such as <code>repo/120</code>, its URL, or its number.",
+            parse_mode=ParseMode.HTML)
+        return
+    if len(matches) > 1:
+        alternatives = ", ".join(review_link(review.task_id, review.url) for review in matches)
+        await update.message.reply_text(
+            f"PR/MR number <code>{html_escape(task_ref)}</code> matches several of your approved reviews: {alternatives}. Use a qualified PR/MR reference.",
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        return
+    if not matches:
+        await update.message.reply_text(
+            f"<code>{html_escape(task_ref)}</code> isn't one of your approved PRs/MRs in this chat. Use <code>!wme</code> to see them.",
+            parse_mode=ParseMode.HTML)
+        return
+
+    review = matches[0]
+    db.mark_merged(review.activity_id, name, user_id)
+    await update.message.reply_text(f"✅ Marked {review_link(review.task_id, review.url)} as merged.",
+                                    parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    logger.info(f"Marked review {review.task_id} as merged in chat {chat_id}")
+
+
+async def member_chat_titles(context: ContextTypes.DEFAULT_TYPE, chat_ids: set[int],
+                             user_id: int) -> tuple[dict[int, str], int]:
+    """Return the titles of the chats the user currently belongs to, and how many couldn't be checked."""
+    limit = asyncio.Semaphore(MEMBERSHIP_CHECK_CONCURRENCY)
+
+    async def check(chat_id: int) -> bool | None:
+        async with limit:
+            try:
+                member = await context.bot.get_chat_member(chat_id, user_id)
+            except (BadRequest, Forbidden):
+                # The user or the bot is no longer in the chat, or the chat is gone.
+                return False
+            except TelegramError as error:
+                logger.warning("Could not check membership of chat %s: %r", chat_id, error)
+                return None
+            return member.status in MEMBER_STATUSES or (
+                member.status == ChatMemberStatus.RESTRICTED and getattr(member, "is_member", False)
+            )
+
+    async def title(chat_id: int) -> str:
+        async with limit:
+            try:
+                return (await context.bot.get_chat(chat_id)).title or f"Chat {chat_id}"
+            except TelegramError:
+                return f"Chat {chat_id}"
+
+    chat_ids = list(chat_ids)
+    results = dict(zip(chat_ids, await asyncio.gather(*(check(chat_id) for chat_id in chat_ids))))
+    member_chats = [chat_id for chat_id in chat_ids if results[chat_id]]
+    titles = dict(zip(member_chats, await asyncio.gather(*(title(chat_id) for chat_id in member_chats))))
+    return titles, sum(1 for result in results.values() if result is None)
+
+
+async def reply_privately(update: Update, context: ContextTypes.DEFAULT_TYPE, texts: list[str]) -> None:
+    """Reply so only the sender sees it; in private chats a normal reply is already private."""
+    chat = update.effective_chat
+    if chat.type == ChatType.PRIVATE:
+        for text in texts:
+            await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        return
+
+    # Ephemeral messages (Bot API 10.2+) are not wrapped by python-telegram-bot yet. Admin bots
+    # may send them at any time; Telegram does not guarantee delivery to offline users.
+    for index, text in enumerate(texts):
+        partial = "Only part of my reply reached you. " if index else ""
+        try:
+            sent = await context.bot.send_message(
+                chat.id, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+                message_thread_id=update.message.message_thread_id if update.message.is_topic_message else None,
+                api_kwargs={"ephemeral_message_parameters": {"receiver_user_id": update.effective_user.id}},
+            )
+        except TelegramError as error:
+            logger.warning("Could not send ephemeral reply in chat %s: %r", chat.id, error)
+            await update.message.reply_text(partial + await private_reply_failure(context, chat.id, error),
+                                            parse_mode=ParseMode.HTML)
+            return
+
+        # The Bot API ignores parameters it doesn't know, so a server without ephemeral support
+        # would post publicly. Ephemeral messages are the only ones returned with message ID 0.
+        if sent.message_id != 0:
+            logger.error("Ephemeral reply in chat %s was posted publicly; deleting it", chat.id)
+            notice = "This Telegram server doesn't support private replies, so I can't show that here."
+            try:
+                await context.bot.delete_message(chat.id, sent.message_id)
+            except TelegramError:
+                logger.exception("Could not delete public reply %s in chat %s", sent.message_id, chat.id)
+                notice += " My reply was posted publicly and I couldn't delete it, so please delete it."
+            await update.message.reply_text(partial + notice)
+            return
+
+
+async def private_reply_failure(context: ContextTypes.DEFAULT_TYPE, chat_id: int, error: TelegramError) -> str:
+    """Explain a failed ephemeral reply without blaming admin rights unless they are the cause."""
+    if isinstance(error, TimedOut):
+        return "Telegram didn't confirm my private reply. If you didn't get it, send the command again."
+    if isinstance(error, (BadRequest, Forbidden)):
+        try:
+            member = await context.bot.get_chat_member(chat_id, context.bot.id)
+        except TelegramError:
+            member = None
+        if member is not None and member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+            return "I couldn't reply privately. Make me a group admin so I can send replies only you can see."
+    return "I couldn't reply privately right now. Please try again later."
+
+
 async def handle_wdone(update: Update, chat_id: int, task_ref: str) -> None:
     """Handle !wdone command - remove a task by PR/MR reference."""
     await handle_remove_task(update, chat_id, task_ref, outcome="done")
@@ -413,6 +597,12 @@ Examples:
 
 <code>!w</code>
 List all tasks in the queue
+
+<code>!wme</code>
+Privately show reviews assigned to you, and your PRs/MRs that were approved (ready to merge) or bounced (only you see the reply; the bot must be a group admin)
+
+<code>!wmerged &lt;PR/MR reference&gt;</code>
+Mark one of your approved PRs/MRs as merged, so it leaves <code>!wme</code>
 
 <code>!wdone &lt;PR/MR reference&gt;</code>
 Remove a completed task by PR/MR reference, URL, or unambiguous PR/MR number

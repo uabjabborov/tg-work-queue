@@ -45,6 +45,18 @@ class ReviewActivity:
 
 
 @dataclass
+class FinishedReview:
+    """A review that left the queue as approved (done) or bounced and now waits on its submitter."""
+    activity_id: int
+    chat_id: int
+    task_id: str
+    url: str
+    outcome: str
+    completed_by: str
+    completed_at: datetime
+
+
+@dataclass
 class LeaderboardSettings:
     chat_id: int
     enabled: bool
@@ -140,6 +152,30 @@ class Database:
                 CREATE INDEX IF NOT EXISTS review_activity_chat_time
                 ON review_activity (chat_id, completed_at)
             """)
+            # Lets !wme find each review's latest outcome without scanning a chat's whole history.
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS review_activity_identity
+                ON review_activity (chat_id, review_host, review_project, review_number, completed_at)
+            """)
+            # Approved reviews their submitters have merged; kept apart from review_activity,
+            # which the leaderboard scores.
+            has_merged_reviews = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'merged_reviews'"
+            ).fetchone() is not None
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS merged_reviews (
+                    activity_id INTEGER PRIMARY KEY REFERENCES review_activity(id),
+                    merged_by TEXT NOT NULL,
+                    merged_by_id INTEGER,
+                    merged_at TEXT NOT NULL
+                )
+            """)
+            if not has_merged_reviews:
+                # Approvals from before merges were tracked were most likely merged long ago.
+                conn.execute("""
+                    INSERT OR IGNORE INTO merged_reviews (activity_id, merged_by, merged_at)
+                    SELECT id, 'Unknown', ? FROM review_activity WHERE outcome = 'done'
+                """, (utc_timestamp(now),))
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS leaderboard_users (
                     chat_id INTEGER NOT NULL,
@@ -308,6 +344,79 @@ class Database:
                 (chat_id,)
             )
             return [self._row_to_task(conn, row) for row in cursor.fetchall()]
+
+    def get_tasks_assigned_to(self, assignee: str, chat_id: Optional[int] = None) -> list[Task]:
+        """Get tasks assigned to a @username, ignoring case, in one chat or across all chats."""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT tasks.*
+                FROM tasks
+                WHERE (? IS NULL OR chat_id = ?)
+                  AND EXISTS (
+                      SELECT 1 FROM task_assignees
+                      WHERE task_assignees.task_id = tasks.id AND LOWER(assignee) = LOWER(?)
+                  )
+                ORDER BY chat_id, seq_num ASC
+                """,
+                (chat_id, chat_id, assignee)
+            )
+            return [self._row_to_task(conn, row) for row in cursor.fetchall()]
+
+    def get_finished_reviews(self, user_id: Optional[int], name: Optional[str], since: datetime,
+                             chat_id: Optional[int] = None) -> list[FinishedReview]:
+        """Reviews this user submitted that are waiting on them: approved and not yet marked merged,
+        or bounced. Only each review's latest outcome after `since` counts, and reviews that were
+        queued again are left out. Approvals the user gave their own review are skipped.
+
+        Submitters are matched by user ID; entries saved before IDs were recorded match by name.
+        """
+        with self._get_connection() as conn:
+            rows = conn.execute("""
+                SELECT * FROM review_activity AS activity
+                WHERE review_host IS NOT NULL AND completed_at >= ?
+                  AND (? IS NULL OR chat_id = ?)
+                  AND (created_by_id = ? OR (created_by_id IS NULL AND LOWER(created_by) = LOWER(?)))
+                  AND (outcome = 'bounce' OR (
+                      (completed_by_id IS NULL OR created_by_id IS NULL OR completed_by_id != created_by_id)
+                      AND id NOT IN (SELECT activity_id FROM merged_reviews)
+                  ))
+                  AND NOT EXISTS (
+                      SELECT 1 FROM review_activity AS later
+                      WHERE later.chat_id = activity.chat_id
+                        AND later.review_host = activity.review_host
+                        AND later.review_project = activity.review_project
+                        AND later.review_number = activity.review_number
+                        AND (later.completed_at > activity.completed_at
+                             OR (later.completed_at = activity.completed_at AND later.id > activity.id))
+                  )
+                ORDER BY chat_id, completed_at, id
+            """, (utc_timestamp(since), chat_id, chat_id, user_id, name)).fetchall()
+            if not rows:
+                return []
+            # Queue entries only store URLs, so compare identities in Python, for the affected chats only.
+            chat_ids = sorted({row["chat_id"] for row in rows})
+            queued = {
+                (task["chat_id"], parsed[1])
+                for task in conn.execute(
+                    f"SELECT chat_id, url FROM tasks WHERE chat_id IN ({', '.join('?' * len(chat_ids))})", chat_ids
+                )
+                if (parsed := parse_review_url(task["url"]))
+            }
+            return [
+                FinishedReview(row["id"], row["chat_id"], row["task_id"], row["url"], row["outcome"],
+                               row["completed_by"], datetime.fromisoformat(row["completed_at"]))
+                for row in rows
+                if (row["chat_id"], (row["review_host"], row["review_project"], row["review_number"])) not in queued
+            ]
+
+    def mark_merged(self, activity_id: int, merged_by: str, merged_by_id: Optional[int] = None,
+                    now: Optional[datetime] = None) -> None:
+        with self._get_connection() as conn:
+            conn.execute("""
+                INSERT OR IGNORE INTO merged_reviews (activity_id, merged_by, merged_by_id, merged_at)
+                VALUES (?, ?, ?, ?)
+            """, (activity_id, merged_by, merged_by_id, utc_timestamp(now)))
 
     def _row_to_task(self, conn: sqlite3.Connection, row: sqlite3.Row) -> Task:
         assignees = self._get_task_assignees(conn, row["id"])
