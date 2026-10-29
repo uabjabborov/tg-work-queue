@@ -5,13 +5,13 @@ from typing import TYPE_CHECKING, Callable, Optional
 from leaderboard import TASHKENT
 
 if TYPE_CHECKING:
-    from database import BouncedReview, Task
+    from database import FinishedReview, Task
 
 # Telegram's limit applies to the visible text after entity parsing, counted in UTF-16 code units.
 MESSAGE_LIMIT = 4096
 HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
-# A bounced PR/MR that hasn't been re-added by then was probably closed or replaced.
-BOUNCE_VISIBLE_DAYS = 14
+# By then a bounced PR/MR that wasn't re-added was probably closed or replaced, and an approved one merged.
+FINISHED_VISIBLE_DAYS = 14
 
 
 def review_link(task_id: str, url: str) -> str:
@@ -41,10 +41,11 @@ def split_messages(blocks: list[str], separator: str = "\n") -> list[str]:
     return messages
 
 
-def bounced_listing(review: "BouncedReview") -> str:
-    bounced_on = review.completed_at.astimezone(TASHKENT).strftime("%b %d")
-    return (f"{review_link(review.task_id, review.url)} — bounced by "
-            f"{html_escape(review.completed_by)} on {bounced_on}")
+def finished_listing(review: "FinishedReview") -> str:
+    verb = "approved" if review.outcome == "done" else "bounced"
+    finished_on = review.completed_at.astimezone(TASHKENT).strftime("%b %d")
+    return (f"{review_link(review.task_id, review.url)} — {verb} by "
+            f"{html_escape(review.completed_by)} on {finished_on}")
 
 
 def grouped_by_chat(items: list, listing: Callable, chat_titles: Optional[dict[int, str]]) -> list[str]:
@@ -58,9 +59,9 @@ def grouped_by_chat(items: list, listing: Callable, chat_titles: Optional[dict[i
     return blocks
 
 
-def my_reviews(assigned: list["Task"], bounced: list["BouncedReview"], has_username: bool = True,
+def my_reviews(assigned: list["Task"], finished: list["FinishedReview"], has_username: bool = True,
                chat_titles: Optional[dict[int, str]] = None, unchecked_chats: int = 0) -> list[str]:
-    """The !wme reply: reviews waiting on you, then your PRs/MRs that need changes.
+    """The !wme reply: reviews waiting on you, then your PRs/MRs to merge, then ones that need changes.
 
     `chat_titles` names each chat when the reply covers several chats.
     """
@@ -72,11 +73,18 @@ def my_reviews(assigned: list["Task"], bounced: list["BouncedReview"], has_usern
         blocks.append("No reviews are assigned to you.")
     else:
         blocks.append("Set a Telegram username to see reviews assigned to you. Reviews are assigned by @username.")
+    approved = [review for review in finished if review.outcome == "done"]
+    if approved:
+        blocks.append(f"\n<b>Approved, ready to merge ({len(approved)})</b>")
+        blocks += grouped_by_chat(approved, finished_listing, chat_titles)
+        blocks.append("<i>After merging, send <code>!wmerged &lt;PR/MR reference&gt;</code> in its chat.</i>")
+    bounced = [review for review in finished if review.outcome == "bounce"]
     if bounced:
         blocks.append(f"\n<b>Your PRs/MRs that need changes ({len(bounced)})</b>")
-        blocks += grouped_by_chat(bounced, bounced_listing, chat_titles)
-        blocks.append(f"<i>Re-add one with <code>!wadd</code> once it's fixed. "
-                      f"Bounces older than {BOUNCE_VISIBLE_DAYS} days are hidden.</i>")
+        blocks += grouped_by_chat(bounced, finished_listing, chat_titles)
+        blocks.append("<i>Re-add one with <code>!wadd</code> once it's fixed.</i>")
+    if finished:
+        blocks.append(f"<i>Approvals and bounces older than {FINISHED_VISIBLE_DAYS} days are hidden.</i>")
     if unchecked_chats:
         groups = "1 of your groups" if unchecked_chats == 1 else f"{unchecked_chats} of your groups"
         blocks.append(f"\n⚠️ I couldn't check {groups} right now, so some reviews may be missing. "

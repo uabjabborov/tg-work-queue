@@ -394,7 +394,7 @@ class WmeCommandTests(unittest.IsolatedAsyncioTestCase):
         _, telegram_bot = await self.command("!wme", username, user_id, chat_id)
         return "\n".join(call.args[1] for call in telegram_bot.send_message.await_args_list)
 
-    async def test_wme_shows_the_submitters_bounced_reviews(self):
+    async def test_wme_shows_the_submitters_approved_and_bounced_reviews(self):
         url = "https://github.com/owner/repo/pull/5"
         await self.command(f"!wadd {url} @bob")
         await self.command("!wadd https://github.com/owner/repo/pull/6 @bob")
@@ -407,7 +407,9 @@ class WmeCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("<b>Your PRs/MRs that need changes (1)</b>", reply)
         self.assertIn(f'<a href="{url}">repo/5</a> — bounced by @bob on ', reply)
         self.assertIn("<code>!wadd</code>", reply)
-        self.assertNotIn("repo/6", reply)
+        self.assertIn("<b>Approved, ready to merge (1)</b>", reply)
+        self.assertIn('<a href="https://github.com/owner/repo/pull/6">repo/6</a> — approved by @bob on ', reply)
+        self.assertLess(reply.index("ready to merge"), reply.index("need changes"))
         # The reviewer and other members don't see it, nor does the same user in another chat.
         self.assertNotIn("repo/5", await self.wme_reply(username="bob", user_id=8))
         self.assertNotIn("repo/5", await self.wme_reply(username="carol", user_id=9))
@@ -474,15 +476,16 @@ class WmeCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_bounces_older_than_the_visible_window_are_hidden(self):
         now = datetime.now(timezone.utc)
-        self.bounce(1, now - timedelta(days=bot.BOUNCE_VISIBLE_DAYS, hours=1))
-        self.bounce(2, now - timedelta(days=bot.BOUNCE_VISIBLE_DAYS - 1))
+        self.bounce(1, now - timedelta(days=bot.FINISHED_VISIBLE_DAYS, hours=1))
+        self.bounce(2, now - timedelta(days=bot.FINISHED_VISIBLE_DAYS - 1))
 
         reply = await self.wme_reply()
 
         self.assertIn("need changes (1)", reply)
         self.assertIn(">repo/2</a>", reply)
         self.assertNotIn(">repo/1</a>", reply)
-        self.assertIn(f"older than {bot.BOUNCE_VISIBLE_DAYS} days are hidden", reply)
+        self.assertIn(f"older than {bot.FINISHED_VISIBLE_DAYS} days are hidden", reply)
+        self.assertNotIn("ready to merge", reply)
 
     async def test_wme_in_private_chat_names_each_group_and_includes_this_chat(self):
         now = datetime.now(timezone.utc)
@@ -508,7 +511,8 @@ class WmeCommandTests(unittest.IsolatedAsyncioTestCase):
             "<i>Team -200</i>\n"
             f'<a href="https://github.com/owner/repo/pull/52">repo/52</a> — bounced by @bob on '
             f'{now.astimezone(TASHKENT).strftime("%b %d")}\n'
-            "<i>Re-add one with <code>!wadd</code> once it's fixed. Bounces older than 14 days are hidden.</i>"
+            "<i>Re-add one with <code>!wadd</code> once it's fixed.</i>\n"
+            "<i>Approvals and bounces older than 14 days are hidden.</i>"
         ))
 
     async def test_wme_in_private_chat_warns_when_groups_could_not_be_checked(self):
@@ -576,6 +580,92 @@ class WmeCommandTests(unittest.IsolatedAsyncioTestCase):
                   AND completed_at > ''
             """))
         self.assertIn("review_activity_identity", plan)
+
+    async def test_approved_review_stays_until_marked_merged(self):
+        url = "https://github.com/owner/repo/pull/5"
+        await self.command(f"!wadd {url} @bob")
+        await self.command("!wdone 5", username="bob", user_id=8)
+        self.assertIn("ready to merge (1)", await self.wme_reply())
+
+        # Only the submitter can mark it, and only in the chat it was reviewed in.
+        update, _ = await self.command("!wmerged 5", username="bob", user_id=8)
+        self.assertIn("isn't one of your approved PRs/MRs in this chat", update.message.reply_text.await_args.args[0])
+        update, _ = await self.command("!wmerged 5", chat_id=2)
+        self.assertIn("isn't one of your approved PRs/MRs in this chat", update.message.reply_text.await_args.args[0])
+        self.assertIn("ready to merge (1)", await self.wme_reply())
+
+        update, _ = await self.command(f"!WMERGED {url}/")
+        self.assertEqual(update.message.reply_text.await_args.args[0], f'✅ Marked <a href="{url}">repo/5</a> as merged.')
+        self.assertNotIn("ready to merge", await self.wme_reply())
+        update, _ = await self.command("!wmerged repo/5")
+        self.assertIn("isn't one of your approved", update.message.reply_text.await_args.args[0])
+
+    async def test_approval_clears_when_re_added_or_bounced_and_skips_self_approval(self):
+        url = "https://github.com/owner/repo/pull/5"
+        await self.command(f"!wadd {url} @bob")
+        await self.command("!wdone 5", username="bob", user_id=8)
+        await self.command(f"!wadd {url} @bob")
+        self.assertNotIn("ready to merge", await self.wme_reply())
+
+        await self.command("!wbounce 5", username="bob", user_id=8)
+        reply = await self.wme_reply()
+        self.assertNotIn("ready to merge", reply)
+        self.assertIn("need changes (1)", reply)
+
+        await self.command(f"!wadd {url} @bob")
+        await self.command("!wdone 5")
+        self.assertNotIn("repo/5", await self.wme_reply())
+
+    async def test_wmerged_rejects_bad_ambiguous_and_anonymous_requests(self):
+        for repo in ("api", "web"):
+            await self.command(f"!wadd https://github.com/owner/{repo}/pull/5 @bob")
+            await self.command(f"!wdone {repo}/5", username="bob", user_id=8)
+
+        cases = (
+            ("!wmerged", "Usage: <code>!wmerged"),
+            ("!wmerged #5", "Invalid PR/MR reference"),
+            ("!wmerged 5", "matches several of your approved reviews"),
+            ("!wmerged 6", "isn't one of your approved"),
+        )
+        for text, expected in cases:
+            with self.subTest(text=text):
+                update, _ = await self.command(text)
+                self.assertIn(expected, update.message.reply_text.await_args.args[0])
+        anonymous = self.make_update("!wmerged api/5", anonymous=True)
+        await self.send(anonymous)
+        self.assertIn("anonymously", anonymous.message.reply_text.await_args.args[0])
+        self.assertIn("ready to merge (2)", await self.wme_reply())
+
+        await self.command("!wmerged api/5")
+        reply = await self.wme_reply()
+        self.assertIn("ready to merge (1)", reply)
+        self.assertIn(">web/5</a>", reply)
+
+    async def test_marking_merged_does_not_change_the_leaderboard(self):
+        await self.command("!wadd https://github.com/owner/repo/pull/5 @bob")
+        await self.command("!wdone 5", username="bob", user_id=8)
+        before = bot.format_leaderboard(bot.build_leaderboard(self.db, 1, bot.reporting_week()))
+        await self.command("!wmerged 5")
+        self.assertEqual(bot.format_leaderboard(bot.build_leaderboard(self.db, 1, bot.reporting_week())), before)
+
+    async def test_approvals_from_before_merge_tracking_are_treated_as_merged(self):
+        await self.command("!wadd https://github.com/owner/repo/pull/5 @bob")
+        await self.command("!wadd https://github.com/owner/repo/pull/6 @bob")
+        await self.command("!wdone 5", username="bob", user_id=8)
+        await self.command("!wbounce 6", username="bob", user_id=8)
+        with sqlite3.connect(self.db.db_path) as conn:
+            conn.execute("DROP TABLE merged_reviews")
+        self.db = Database(self.db.db_path)
+
+        with patch.object(bot, "db", self.db):
+            reply = await self.wme_reply()
+            self.assertNotIn("ready to merge", reply)
+            self.assertIn("need changes (1)", reply)
+
+            # Approvals after the upgrade are tracked as usual.
+            await self.command("!wadd https://github.com/owner/repo/pull/7 @bob")
+            await self.command("!wdone 7", username="bob", user_id=8)
+            self.assertIn("ready to merge (1)", await self.wme_reply())
 
     def test_visible_length_ignores_markup_and_counts_like_telegram(self):
         self.assertEqual(visible_length('<a href="https://example.com/very/long">repo/1</a> &lt;b&gt;'), 10)

@@ -10,7 +10,8 @@ A Telegram bot that manages task queues for GitLab/GitHub merge requests in chan
 |---------|-------------|
 | `!wadd <MR/PR URL> [@username ...]` | Add a merge request (optionally assign to one or more users) |
 | `!w` | List all tasks in the queue |
-| `!wme` | Privately show reviews assigned to you, and your PRs/MRs that were bounced |
+| `!wme` | Privately show reviews assigned to you, and your PRs/MRs that were approved (ready to merge) or bounced |
+| `!wmerged <PR/MR reference>` | Mark one of your approved PRs/MRs as merged, so it leaves `!wme` |
 | `!wdone <PR/MR reference>` | Remove a completed review |
 | `!wbounce <PR/MR reference>` | Remove a review with a "Changes required" comment in the chat |
 | `!wassign <PR/MR reference> @username [...]` | Assign or reassign a review (replaces all existing assignees) |
@@ -56,7 +57,7 @@ PR/MR references are derived from the merge request or pull request URL:
 | `http://gitlab.example.com/group/monorepo/-/merge_requests/120` | `monorepo/120` |
 | `https://github.com/owner/repo/pull/45` | `repo/45` |
 
-Use `repo/N`, the full PR/MR URL, or a bare PR/MR number such as `120` with `!wdone`, `!wbounce`, and `!wassign`. A bare number works only when one review in the current chat has that number. If several reviews have it, use a qualified reference such as `monorepo/120`. Queue sequence numbers and legacy `#N` commands are not accepted; use `!w` to see current references.
+Use `repo/N`, the full PR/MR URL, or a bare PR/MR number such as `120` with `!wdone`, `!wbounce`, `!wassign`, and `!wmerged`. A bare number works only when one review in the current chat has that number. If several reviews have it, use a qualified reference such as `monorepo/120`. Queue sequence numbers and legacy `#N` commands are not accepted; use `!w` to see current references.
 
 ## Setup
 
@@ -145,16 +146,27 @@ docker-compose down
 # monorepo/120 → @alice, @bob (by @dave)
 # backend/45 (by @dave)
 
-# Show reviews assigned to you (only you see the reply)
+# Show reviews assigned to you, and your own PRs/MRs to merge or fix (only you see the reply)
 !wme
 
 # Response (visible only to @alice):
 # Assigned to you (1)
 # monorepo/120 → @alice, @bob (by @dave)
 #
+# Approved, ready to merge (1)
+# backend/48 — approved by @bob on Oct 28
+# After merging, send !wmerged <PR/MR reference> in its chat.
+#
 # Your PRs/MRs that need changes (1)
 # backend/52 — bounced by @bob on Oct 28
-# Re-add one with !wadd once it's fixed. Bounces older than 14 days are hidden.
+# Re-add one with !wadd once it's fixed.
+# Approvals and bounces older than 14 days are hidden.
+
+# After merging an approved PR/MR, take it off your list
+!wmerged backend/48
+
+# Response:
+# ✅ Marked backend/48 as merged.
 
 # Assign or reassign a task (replaces all existing assignees)
 !wassign monorepo/120 @eve
@@ -261,7 +273,7 @@ Reminders use 5-part cron expressions in UTC timezone:
 - **Isolated Queues**: Each channel/group has its own independent task queue
 - **Unique Tasks**: PR/MR references are unique per channel (the same MR can't be added twice)
 - **Clickable Links**: Tasks are displayed as clickable links to the MR/PR
-- **Private Assignment View**: `!wme` replies with an ephemeral message only the sender can see, including your PRs/MRs that need changes
+- **Private Assignment View**: `!wme` replies with an ephemeral message only the sender can see, including your PRs/MRs that are ready to merge or need changes
 - **Custom Reminders**: Each channel can configure its own reminder schedule
 - **Weekly Leaderboards**: Separate contributor and reviewer rankings and Monday recaps for each chat
 - **Persistent Storage**: Data is stored in SQLite database (`workqueue.db`)
@@ -271,7 +283,12 @@ Reminders use 5-part cron expressions in UTC timezone:
 
 `!wme` lists the reviews in the current chat whose assignees include your `@username`. Matching ignores case. Long lists are split across several messages.
 
-It also lists the PRs/MRs you added that a reviewer bounced with `!wbounce`, with who bounced them and when (Asia/Tashkent date). A bounced PR/MR stays on your list until it's added to the queue again with `!wadd`, so re-add it once the changes are made. If it's bounced again later, it comes back. Bounces older than 14 days are hidden, since the PR/MR was probably closed or replaced. Bounces are matched to you by your Telegram account, so they appear even without a username.
+It also lists the PRs/MRs you added that a reviewer finished, with who finished them and when (Asia/Tashkent date):
+
+- **Approved, ready to merge:** a reviewer ran `!wdone`. The bot can't see when you merge, so after merging send `!wmerged <PR/MR reference>` in the same chat to take it off your list. `!wmerged` only works on your own approved PRs/MRs. Running `!wdone` on your own PR/MR doesn't count as an approval. Marking a PR/MR as merged doesn't change the leaderboard.
+- **Need changes:** a reviewer ran `!wbounce`. It stays on your list until it's added to the queue again with `!wadd`, so re-add it once the changes are made.
+
+Only each PR/MR's latest outcome counts: re-adding one takes it off the list, and bouncing an approved one moves it to "need changes". Approvals and bounces older than 14 days are hidden, since by then the PR/MR was probably merged, closed, or replaced. They're matched to you by your Telegram account, so they appear even without a username. Approvals from before `!wmerged` existed are treated as already merged.
 
 - In groups the reply is a Telegram [ephemeral message](https://core.telegram.org/bots/api#ephemeral-messages-and-commands) (Bot API 10.2+): only you and the bot see it. Telegram may drop it if you are offline or after an app restart, so just send `!wme` again.
 - The bot must be a group **admin** to send ephemeral messages. Otherwise it replies with a short notice instead of posting your list publicly. If Telegram ever posts the reply publicly (for example, a self-hosted Bot API server without ephemeral support), the bot deletes it immediately.
