@@ -45,6 +45,15 @@ class ReviewActivity:
 
 
 @dataclass
+class BouncedReview:
+    chat_id: int
+    task_id: str
+    url: str
+    completed_by: str
+    completed_at: datetime
+
+
+@dataclass
 class LeaderboardSettings:
     chat_id: int
     enabled: bool
@@ -326,6 +335,42 @@ class Database:
                 (chat_id, chat_id, assignee)
             )
             return [self._row_to_task(conn, row) for row in cursor.fetchall()]
+
+    def get_bounced_reviews(self, user_id: Optional[int], name: Optional[str],
+                            chat_id: Optional[int] = None) -> list[BouncedReview]:
+        """Reviews this user submitted whose latest outcome is a bounce and that aren't queued again.
+
+        Submitters are matched by user ID; entries saved before IDs were recorded match by name.
+        """
+        with self._get_connection() as conn:
+            rows = conn.execute("""
+                SELECT * FROM review_activity AS activity
+                WHERE outcome = 'bounce' AND review_host IS NOT NULL
+                  AND (? IS NULL OR chat_id = ?)
+                  AND (created_by_id = ? OR (created_by_id IS NULL AND LOWER(created_by) = LOWER(?)))
+                  AND NOT EXISTS (
+                      SELECT 1 FROM review_activity AS later
+                      WHERE later.chat_id = activity.chat_id
+                        AND later.review_host = activity.review_host
+                        AND later.review_project = activity.review_project
+                        AND later.review_number = activity.review_number
+                        AND (later.completed_at > activity.completed_at
+                             OR (later.completed_at = activity.completed_at AND later.id > activity.id))
+                  )
+                ORDER BY chat_id, completed_at, id
+            """, (chat_id, chat_id, user_id, name)).fetchall()
+            queued = {
+                (row["chat_id"], parsed[1])
+                for row in conn.execute("SELECT chat_id, url FROM tasks WHERE (? IS NULL OR chat_id = ?)",
+                                        (chat_id, chat_id))
+                if (parsed := parse_review_url(row["url"]))
+            }
+            return [
+                BouncedReview(row["chat_id"], row["task_id"], row["url"], row["completed_by"],
+                              datetime.fromisoformat(row["completed_at"]))
+                for row in rows
+                if (row["chat_id"], (row["review_host"], row["review_project"], row["review_number"])) not in queued
+            ]
 
     def _row_to_task(self, conn: sqlite3.Connection, row: sqlite3.Row) -> Task:
         assignees = self._get_task_assignees(conn, row["id"])

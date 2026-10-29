@@ -1,8 +1,10 @@
+import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 
 from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut
 
@@ -379,6 +381,88 @@ class WmeCommandTests(unittest.IsolatedAsyncioTestCase):
         telegram_bot = await self.send(anonymous)
         telegram_bot.send_message.assert_not_awaited()
         self.assertIn("anonymously", anonymous.message.reply_text.await_args.args[0])
+
+    async def command(self, text, username="alice", user_id=7, chat_id=1):
+        update = self.make_update(text, username=username, user_id=user_id, chat_id=chat_id)
+        telegram_bot = await self.send(update)
+        return update, telegram_bot
+
+    async def wme_reply(self, username="alice", user_id=7, chat_id=1):
+        _, telegram_bot = await self.command("!wme", username, user_id, chat_id)
+        return "\n".join(call.args[1] for call in telegram_bot.send_message.await_args_list)
+
+    async def test_wme_shows_the_submitters_bounced_reviews(self):
+        url = "https://github.com/owner/repo/pull/5"
+        await self.command(f"!wadd {url} @bob")
+        await self.command("!wadd https://github.com/owner/repo/pull/6 @bob")
+        await self.command("!wdone repo/6", username="bob", user_id=8)
+        await self.command("!wbounce repo/5", username="bob", user_id=8)
+
+        reply = await self.wme_reply()
+
+        self.assertIn("No reviews are assigned to you.", reply)
+        self.assertIn("<b>Your PRs/MRs that need changes (1)</b>", reply)
+        self.assertIn(f'<a href="{url}">repo/5</a> — bounced by @bob on ', reply)
+        self.assertIn("<code>!wadd</code>", reply)
+        self.assertNotIn("repo/6", reply)
+        # The reviewer and other members don't see it, nor does the same user in another chat.
+        self.assertNotIn("repo/5", await self.wme_reply(username="bob", user_id=8))
+        self.assertNotIn("repo/5", await self.wme_reply(username="carol", user_id=9))
+        self.assertNotIn("repo/5", await self.wme_reply(chat_id=2))
+
+    async def test_bounced_review_clears_when_re_added_and_returns_when_bounced_again(self):
+        url = "https://github.com/owner/repo/pull/5"
+        await self.command(f"!wadd {url} @bob")
+        await self.command("!wbounce 5", username="bob", user_id=8)
+        self.assertIn("repo/5", await self.wme_reply())
+
+        await self.command(f"!wadd {url}/ @bob")
+        self.assertNotIn("need changes", await self.wme_reply())
+
+        await self.command("!wbounce 5", username="bob", user_id=8)
+        self.assertIn("need changes (1)", await self.wme_reply())
+
+        await self.command(f"!wadd {url} @bob")
+        await self.command("!wdone 5", username="bob", user_id=8)
+        self.assertNotIn("need changes", await self.wme_reply())
+
+    async def test_bounced_reviews_match_by_user_id_or_legacy_name(self):
+        bounced_at = datetime(2026, 10, 27, 20, 30, tzinfo=timezone.utc)
+        for number, created_by, created_by_id in ((1, "@old_name", 7), (2, "@Alice", None), (3, "@alice", 9)):
+            self.add_task(number, ["@bob"])
+            task = self.db.get_tasks(1)[-1]
+            with sqlite3.connect(self.db.db_path) as conn:
+                conn.execute("UPDATE tasks SET created_by = ?, created_by_id = ? WHERE id = ?",
+                             (created_by, created_by_id, task.id))
+            self.db.complete_task(1, task.id, "bounce", "@bob", 8, completed_at=bounced_at)
+
+        reply = await self.wme_reply()
+
+        self.assertIn("need changes (2)", reply)
+        self.assertIn(">repo/1</a> — bounced by @bob on Oct 28", reply)  # 01:30 in Tashkent
+        self.assertIn(">repo/2</a>", reply)
+        self.assertNotIn(">repo/3</a>", reply)
+
+    async def test_wme_without_username_still_shows_bounced_reviews(self):
+        await self.command("!wadd https://github.com/owner/repo/pull/5 @bob", username=None)
+        await self.command("!wbounce 5", username="bob", user_id=8)
+
+        reply = await self.wme_reply(username=None)
+
+        self.assertIn("Set a Telegram username", reply)
+        self.assertIn("need changes (1)", reply)
+
+    async def test_wme_in_private_chat_hides_bounces_from_groups_the_sender_left(self):
+        for chat_id in (-100, -300):
+            await self.command("!wadd https://github.com/owner/repo/pull/5 @bob", chat_id=chat_id)
+            await self.command("!wbounce 5", username="bob", user_id=8, chat_id=chat_id)
+        update = self.make_update("!wme", chat_type="private", chat_id=7)
+
+        telegram_bot = await self.send(update, self.make_bot(member_statuses={-300: "left"}))
+
+        telegram_bot.get_chat_member.assert_has_awaits([call(-100, 7), call(-300, 7)], any_order=True)
+        reply = update.message.reply_text.await_args.args[0]
+        self.assertIn("need changes (1)", reply)
 
     def test_visible_length_ignores_markup_and_counts_like_telegram(self):
         self.assertEqual(visible_length('<a href="https://example.com/very/long">repo/1</a> &lt;b&gt;'), 10)

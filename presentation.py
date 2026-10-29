@@ -2,8 +2,10 @@ import re
 from html import escape as html_escape, unescape as html_unescape
 from typing import TYPE_CHECKING
 
+from leaderboard import TASHKENT
+
 if TYPE_CHECKING:
-    from database import Task
+    from database import BouncedReview, Task
 
 # Telegram's limit applies to the visible text after entity parsing, counted in UTF-16 code units.
 MESSAGE_LIMIT = 4096
@@ -37,7 +39,23 @@ def split_messages(blocks: list[str], separator: str = "\n") -> list[str]:
     return messages
 
 
-def assigned_reviews(tasks: list["Task"]) -> list[str]:
-    if not tasks:
-        return ["No reviews are assigned to you."]
-    return split_messages([f"<b>Assigned to you ({len(tasks)})</b>"] + [task_listing(task) for task in tasks])
+def bounced_listing(review: "BouncedReview") -> str:
+    bounced_on = review.completed_at.astimezone(TASHKENT).strftime("%b %d")
+    return (f"{review_link(review.task_id, review.url)} — bounced by "
+            f"{html_escape(review.completed_by)} on {bounced_on}")
+
+
+def my_reviews(assigned: list["Task"], bounced: list["BouncedReview"], has_username: bool = True) -> list[str]:
+    """The !wme reply: reviews waiting on you, then your PRs/MRs that need changes."""
+    blocks = []
+    if assigned:
+        blocks += [f"<b>Assigned to you ({len(assigned)})</b>"] + [task_listing(task) for task in assigned]
+    elif has_username:
+        blocks.append("No reviews are assigned to you.")
+    else:
+        blocks.append("Set a Telegram username to see reviews assigned to you. Reviews are assigned by @username.")
+    if bounced:
+        blocks.append(f"\n<b>Your PRs/MRs that need changes ({len(bounced)})</b>")
+        blocks += [bounced_listing(review) for review in bounced]
+        blocks.append("<i>Re-add one with <code>!wadd</code> once it's fixed.</i>")
+    return split_messages(blocks)

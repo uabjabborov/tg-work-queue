@@ -12,7 +12,7 @@ from html import escape as html_escape
 
 from database import Database, Task
 from leaderboard import build_leaderboard, format_leaderboard, reporting_week
-from presentation import assigned_reviews, review_link, task_listing
+from presentation import my_reviews, review_link, task_listing
 from review_urls import normalize_review_number, parse_review_url
 from scheduler import add_reminder_job, remove_reminder_job, setup_scheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -360,7 +360,7 @@ async def handle_w(update: Update, chat_id: int) -> None:
 
 
 async def handle_wme(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
-    """Handle !wme command - privately show reviews assigned to the sender."""
+    """Handle !wme command - privately show reviews assigned to the sender and their bounced PRs/MRs."""
     user_id, _ = sender_identity(update)
     if user_id is None:
         # Private replies go to one user, so they need an identified sender.
@@ -369,21 +369,21 @@ async def handle_wme(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id
         return
 
     username = update.effective_user.username
-    if not username:
-        await reply_privately(update, context, ["Set a Telegram username to use <code>!wme</code>. Reviews are assigned by @username."])
-        return
+    name = f"@{username}" if username else None
+    # A direct message has no queue of its own, so look across every group.
+    scope = None if update.effective_chat.type == ChatType.PRIVATE else chat_id
+    assigned = db.get_tasks_assigned_to(name, scope) if name else []
+    bounced = db.get_bounced_reviews(user_id, name, scope)
+    if scope is None:
+        # Only show groups the sender is still in: a matching @username alone could be a typo or a reclaimed name.
+        member_chats = await member_chat_ids(context, {item.chat_id for item in [*assigned, *bounced]}, user_id)
+        assigned = [task for task in assigned if task.chat_id in member_chats]
+        bounced = [review for review in bounced if review.chat_id in member_chats]
+    await reply_privately(update, context, my_reviews(assigned, bounced, has_username=bool(username)))
 
-    # A direct message has no queue of its own, so list assignments from every group the
-    # sender is still in. A matching @username alone could be a typo or a reclaimed name.
-    if update.effective_chat.type == ChatType.PRIVATE:
-        tasks = await tasks_in_member_groups(context, db.get_tasks_assigned_to(f"@{username}"), user_id)
-    else:
-        tasks = db.get_tasks_assigned_to(f"@{username}", chat_id)
-    await reply_privately(update, context, assigned_reviews(tasks))
 
-
-async def tasks_in_member_groups(context: ContextTypes.DEFAULT_TYPE, tasks: list[Task], user_id: int) -> list[Task]:
-    """Keep only tasks from chats the user currently belongs to."""
+async def member_chat_ids(context: ContextTypes.DEFAULT_TYPE, chat_ids: set[int], user_id: int) -> set[int]:
+    """Return the chats the user currently belongs to."""
     async def is_member(chat_id: int) -> bool:
         try:
             member = await context.bot.get_chat_member(chat_id, user_id)
@@ -393,9 +393,9 @@ async def tasks_in_member_groups(context: ContextTypes.DEFAULT_TYPE, tasks: list
             member.status == ChatMemberStatus.RESTRICTED and getattr(member, "is_member", False)
         )
 
-    chat_ids = list(dict.fromkeys(task.chat_id for task in tasks))
-    memberships = dict(zip(chat_ids, await asyncio.gather(*(is_member(chat_id) for chat_id in chat_ids))))
-    return [task for task in tasks if memberships[task.chat_id]]
+    chat_ids = list(chat_ids)
+    memberships = await asyncio.gather(*(is_member(chat_id) for chat_id in chat_ids))
+    return {chat_id for chat_id, is_in in zip(chat_ids, memberships) if is_in}
 
 
 async def reply_privately(update: Update, context: ContextTypes.DEFAULT_TYPE, texts: list[str]) -> None:
@@ -512,7 +512,7 @@ Examples:
 List all tasks in the queue
 
 <code>!wme</code>
-Privately show reviews assigned to you (only you see the reply; the bot must be a group admin)
+Privately show reviews assigned to you and your PRs/MRs that were bounced (only you see the reply; the bot must be a group admin)
 
 <code>!wdone &lt;PR/MR reference&gt;</code>
 Remove a completed task by PR/MR reference, URL, or unambiguous PR/MR number
