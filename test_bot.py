@@ -18,6 +18,11 @@ with patch.object(Database, "_init_db"):
     import bot
 
 
+def private_reply(telegram_bot):
+    """Join the ephemeral messages the bot sent in a group."""
+    return "\n".join(call.args[1] for call in telegram_bot.send_message.await_args_list)
+
+
 class QueueReferenceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         temp_dir = tempfile.TemporaryDirectory()
@@ -448,7 +453,7 @@ class WmeCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def wme_reply(self, username="alice", user_id=7, chat_id=1):
         _, telegram_bot = await self.command("!wme", username, user_id, chat_id)
-        return "\n".join(call.args[1] for call in telegram_bot.send_message.await_args_list)
+        return private_reply(telegram_bot)
 
     async def test_wme_shows_the_submitters_approved_and_bounced_reviews(self):
         url = "https://github.com/owner/repo/pull/5"
@@ -681,13 +686,19 @@ class WmeCommandTests(unittest.IsolatedAsyncioTestCase):
         cases = (
             ("!wmerged", "Usage: <code>!wmerged"),
             ("!wmerged #5", "Invalid PR/MR reference"),
-            ("!wmerged 5", "matches several of your approved reviews"),
             ("!wmerged 6", "isn't one of your approved"),
         )
         for text, expected in cases:
             with self.subTest(text=text):
-                update, _ = await self.command(text)
+                update, telegram_bot = await self.command(text)
                 self.assertIn(expected, update.message.reply_text.await_args.args[0])
+                telegram_bot.send_message.assert_not_awaited()
+        # The alternatives list the sender's approved PRs/MRs, so only they see them.
+        update, telegram_bot = await self.command("!wmerged 5")
+        reply = private_reply(telegram_bot)
+        self.assertIn("matches several of your approved reviews", reply)
+        self.assertIn(">api/5</a>", reply)
+        update.message.reply_text.assert_not_awaited()
         anonymous = self.make_update("!wmerged api/5", anonymous=True)
         await self.send(anonymous)
         self.assertIn("anonymously", anonymous.message.reply_text.await_args.args[0])
@@ -734,9 +745,12 @@ class WmeCommandTests(unittest.IsolatedAsyncioTestCase):
         await self.finish((70, 120), outcome="wbounce")
         self.add_task(90, ["@alice"])
 
-        update, _ = await self.command("!WCLEAR 55, 67 70\n88..100 999 90")
+        update, telegram_bot = await self.command("!WCLEAR 55, 67 70\n88..100 999 90")
 
-        reply = update.message.reply_text.await_args.args[0]
+        reply = private_reply(telegram_bot)
+        self.assertEqual(telegram_bot.send_message.await_args.kwargs["api_kwargs"],
+                         {"ephemeral_message_parameters": {"receiver_user_id": 7}})
+        update.message.reply_text.assert_not_awaited()
         self.assertTrue(reply.startswith("🧹 <b>Cleared 5 from your <code>!wme</code> list</b>\n"))
         for number in (55, 67, 70, 88, 100):
             self.assertIn(f">repo/{number}</a>", reply)
@@ -761,16 +775,18 @@ class WmeCommandTests(unittest.IsolatedAsyncioTestCase):
         await self.command("!wbounce 9", username="bob", user_id=8)
         before = bot.format_leaderboard(bot.build_leaderboard(self.db, 1, bot.reporting_week()))
 
-        update, _ = await self.command("!wclear ALL")
+        update, telegram_bot = await self.command("!wclear ALL")
 
-        self.assertIn("Cleared 3", update.message.reply_text.await_args.args[0])
+        self.assertIn("Cleared 3", private_reply(telegram_bot))
+        update.message.reply_text.assert_not_awaited()
         self.assertNotIn("repo/", await self.wme_reply())
         self.assertIn(">repo/8</a>", await self.wme_reply(chat_id=2))
         self.assertIn(">repo/9</a>", await self.wme_reply(username="carol", user_id=9))
         self.assertEqual(bot.format_leaderboard(bot.build_leaderboard(self.db, 1, bot.reporting_week())), before)
 
-        update, _ = await self.command("!wclear all")
-        self.assertIn("Nothing to clear", update.message.reply_text.await_args.args[0])
+        update, telegram_bot = await self.command("!wclear all")
+        self.assertIn("Nothing to clear", private_reply(telegram_bot))
+        update.message.reply_text.assert_not_awaited()
 
     async def test_wclear_rejects_bad_ambiguous_and_anonymous_requests(self):
         for repo in ("api", "web"):
@@ -780,20 +796,53 @@ class WmeCommandTests(unittest.IsolatedAsyncioTestCase):
             ("!wclear", "Usage: <code>!wclear"),
             ("!wclear , ,", "Usage: <code>!wclear"),
             ("!wclear 5 #6", "Invalid PR/MR reference <code>#6</code>"),
-            ("!wclear 5", "matches several of your PRs/MRs"),
         )
+        # These errors don't list the sender's PRs/MRs, so they stay public.
         for text, expected in cases:
             with self.subTest(text=text):
-                update, _ = await self.command(text)
+                update, telegram_bot = await self.command(text)
                 self.assertIn(expected, update.message.reply_text.await_args.args[0])
+                telegram_bot.send_message.assert_not_awaited()
+        _, telegram_bot = await self.command("!wclear 5")
+        self.assertIn("matches several of your PRs/MRs", private_reply(telegram_bot))
         anonymous = self.make_update("!wclear all", anonymous=True)
         await self.send(anonymous)
         self.assertIn("anonymously", anonymous.message.reply_text.await_args.args[0])
         self.assertIn("ready to merge (2)", await self.wme_reply())
 
         # A range takes every matching PR/MR, and huge numbers don't break the comparison.
-        update, _ = await self.command(f"!wclear 1-{'9' * 5000}")
-        self.assertIn("Cleared 2", update.message.reply_text.await_args.args[0])
+        _, telegram_bot = await self.command(f"!wclear 1-{'9' * 5000}")
+        self.assertIn("Cleared 2", private_reply(telegram_bot))
+
+    async def test_wclear_says_publicly_how_many_were_cleared_when_the_private_reply_fails(self):
+        cases = (
+            ("not admin", self.make_bot(AsyncMock(side_effect=BadRequest("Not enough rights")), bot_status="member"),
+             "Make me a group admin"),
+            ("timeout", self.make_bot(AsyncMock(side_effect=TimedOut())), "you may not have gotten the details"),
+            ("other error", self.make_bot(AsyncMock(side_effect=RetryAfter(5))), "I couldn't reply privately right now."),
+            ("posted publicly", self.make_bot(AsyncMock(return_value=SimpleNamespace(message_id=321))),
+             "doesn't support private replies"),
+        )
+        for name, telegram_bot, expected in cases:
+            with self.subTest(name):
+                await self.finish((5, 6))
+                update = self.make_update("!wclear all", username="alice")
+
+                await self.send(update, telegram_bot)
+
+                notice = update.message.reply_text.await_args.args[0]
+                self.assertTrue(notice.startswith(
+                    "Cleared 2 from your <code>!wme</code> list, but I couldn't show which ones privately. "))
+                self.assertIn(expected, notice)
+                # Sending !wclear again can't bring the reply back, and the notice must not leak the list.
+                self.assertNotIn("again", notice)
+                self.assertNotIn("repo/", notice)
+                self.assertEqual(update.message.reply_text.await_args.kwargs["parse_mode"], "HTML")
+                self.assertNotIn("repo/", await self.wme_reply())
+
+        update = self.make_update("!wclear all")
+        await self.send(update, self.make_bot(AsyncMock(side_effect=TimedOut())))
+        self.assertTrue(update.message.reply_text.await_args.args[0].startswith("Nothing was cleared. "))
 
     async def test_wclear_in_private_chat_clears_groups_the_sender_is_in(self):
         for chat_id in (-100, -200, -300):

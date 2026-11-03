@@ -221,7 +221,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     wmerged_match = WMERGED_PATTERN.match(text)
     if wmerged_match:
-        await handle_wmerged(update, chat_id, wmerged_match.group(1).strip())
+        await handle_wmerged(update, context, chat_id, wmerged_match.group(1).strip())
         return
     elif WMERGED_PREFIX.match(text):
         await update.message.reply_text(
@@ -414,7 +414,7 @@ async def handle_wme(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id
                                                       chat_titles=chat_titles, unchecked_chats=unchecked))
 
 
-async def handle_wmerged(update: Update, chat_id: int, task_ref: str) -> None:
+async def handle_wmerged(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, task_ref: str) -> None:
     """Handle !wmerged command - take one of the sender's approved PRs/MRs off their !wme list."""
     user_id, name = sender_identity(update)
     if user_id is None:
@@ -433,10 +433,11 @@ async def handle_wmerged(update: Update, chat_id: int, task_ref: str) -> None:
             parse_mode=ParseMode.HTML)
         return
     if len(matches) > 1:
+        # The alternatives list the sender's approved PRs/MRs, which only they should see.
         alternatives = ", ".join(review_link(review.task_id, review.url) for review in matches)
-        await update.message.reply_text(
-            f"PR/MR number <code>{html_escape(task_ref)}</code> matches several of your approved reviews: {alternatives}. Use a qualified PR/MR reference.",
-            parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        await reply_privately(update, context, [
+            f"PR/MR number <code>{html_escape(task_ref)}</code> matches several of your approved reviews: {alternatives}. Use a qualified PR/MR reference."
+        ])
         return
     if not matches:
         await update.message.reply_text(
@@ -470,7 +471,7 @@ def reviews_in_range(reviews: list[FinishedReview], low: str, high: str) -> list
 
 
 async def handle_wclear(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, args: str) -> None:
-    """Handle !wclear command - take approved or bounced PRs/MRs off the sender's !wme list."""
+    """Handle !wclear command - take approved or bounced PRs/MRs off the sender's !wme list and privately list them."""
     user_id, name = sender_identity(update)
     if user_id is None:
         await update.message.reply_text("<code>!wclear</code> needs to know who you are. Send it from your own account, not anonymously.",
@@ -526,9 +527,12 @@ async def handle_wclear(update: Update, context: ContextTypes.DEFAULT_TYPE, chat
     if unchecked:
         groups = "1 of your groups" if unchecked == 1 else f"{unchecked} of your groups"
         blocks.append(f"⚠️ I couldn't check {groups} right now, so nothing there was cleared.")
-    for message in split_messages(blocks):
-        await update.message.reply_text(message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    logger.info(f"Cleared {len(cleared)} finished reviews for user {user_id} in chat {chat_id}")
+    # The clear has already happened, so a failed private reply still says how many were cleared.
+    outcome = (f"Cleared {len(cleared)} from your <code>!wme</code> list, but I couldn't show which ones privately."
+               if cleared else "Nothing was cleared.")
+    delivered = await reply_privately(update, context, split_messages(blocks), public_outcome=outcome)
+    logger.info(f"Cleared {len(cleared)} finished reviews for user {user_id} in chat {chat_id}"
+                + ("" if delivered else "; the private reply was not delivered"))
 
 
 async def member_chat_titles(context: ContextTypes.DEFAULT_TYPE, chat_ids: set[int],
@@ -564,18 +568,24 @@ async def member_chat_titles(context: ContextTypes.DEFAULT_TYPE, chat_ids: set[i
     return titles, sum(1 for result in results.values() if result is None)
 
 
-async def reply_privately(update: Update, context: ContextTypes.DEFAULT_TYPE, texts: list[str]) -> None:
-    """Reply so only the sender sees it; in private chats a normal reply is already private."""
+async def reply_privately(update: Update, context: ContextTypes.DEFAULT_TYPE, texts: list[str],
+                          public_outcome: str | None = None) -> bool:
+    """Reply so only the sender sees it; in private chats a normal reply is already private.
+
+    Commands that change data pass public_outcome, a summary without any PR/MR links that is posted
+    publicly if the private reply fails, since sending such a command again can't recover the reply.
+    Returns whether the whole reply was delivered privately.
+    """
     chat = update.effective_chat
     if chat.type == ChatType.PRIVATE:
         for text in texts:
             await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-        return
+        return True
 
     # Ephemeral messages (Bot API 10.2+) are not wrapped by python-telegram-bot yet. Admin bots
     # may send them at any time; Telegram does not guarantee delivery to offline users.
     for index, text in enumerate(texts):
-        partial = "Only part of my reply reached you. " if index else ""
+        prefix = ("Only part of my reply reached you. " if index else "") + (f"{public_outcome} " if public_outcome else "")
         try:
             sent = await context.bot.send_message(
                 chat.id, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
@@ -584,9 +594,9 @@ async def reply_privately(update: Update, context: ContextTypes.DEFAULT_TYPE, te
             )
         except TelegramError as error:
             logger.warning("Could not send ephemeral reply in chat %s: %r", chat.id, error)
-            await update.message.reply_text(partial + await private_reply_failure(context, chat.id, error),
-                                            parse_mode=ParseMode.HTML)
-            return
+            failure = await private_reply_failure(context, chat.id, error, can_resend=public_outcome is None)
+            await update.message.reply_text(prefix + failure, parse_mode=ParseMode.HTML)
+            return False
 
         # The Bot API ignores parameters it doesn't know, so a server without ephemeral support
         # would post publicly. Ephemeral messages are the only ones returned with message ID 0.
@@ -598,14 +608,21 @@ async def reply_privately(update: Update, context: ContextTypes.DEFAULT_TYPE, te
             except TelegramError:
                 logger.exception("Could not delete public reply %s in chat %s", sent.message_id, chat.id)
                 notice += " My reply was posted publicly and I couldn't delete it, so please delete it."
-            await update.message.reply_text(partial + notice)
-            return
+            await update.message.reply_text(prefix + notice, parse_mode=ParseMode.HTML)
+            return False
+    return True
 
 
-async def private_reply_failure(context: ContextTypes.DEFAULT_TYPE, chat_id: int, error: TelegramError) -> str:
-    """Explain a failed ephemeral reply without blaming admin rights unless they are the cause."""
+async def private_reply_failure(context: ContextTypes.DEFAULT_TYPE, chat_id: int, error: TelegramError,
+                                can_resend: bool = True) -> str:
+    """Explain a failed ephemeral reply without blaming admin rights unless they are the cause.
+
+    Only suggest sending the command again when doing so would repeat the same reply.
+    """
     if isinstance(error, TimedOut):
-        return "Telegram didn't confirm my private reply. If you didn't get it, send the command again."
+        if can_resend:
+            return "Telegram didn't confirm my private reply. If you didn't get it, send the command again."
+        return "Telegram didn't confirm my private reply, so you may not have gotten the details."
     if isinstance(error, (BadRequest, Forbidden)):
         try:
             member = await context.bot.get_chat_member(chat_id, context.bot.id)
@@ -613,7 +630,9 @@ async def private_reply_failure(context: ContextTypes.DEFAULT_TYPE, chat_id: int
             member = None
         if member is not None and member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
             return "I couldn't reply privately. Make me a group admin so I can send replies only you can see."
-    return "I couldn't reply privately right now. Please try again later."
+    if can_resend:
+        return "I couldn't reply privately right now. Please try again later."
+    return "I couldn't reply privately right now."
 
 
 async def handle_wdone(update: Update, chat_id: int, task_ref: str) -> None:
@@ -688,7 +707,7 @@ Privately show reviews assigned to you, and your PRs/MRs that were approved (rea
 Mark one of your approved PRs/MRs as merged, so it leaves <code>!wme</code>
 
 <code>!wclear &lt;PR/MR references&gt;</code> / <code>!wclear all</code>
-Clear your approved or bounced PRs/MRs from <code>!wme</code>
+Clear your approved or bounced PRs/MRs from <code>!wme</code> (only you see the reply; the bot must be a group admin)
 Examples: <code>!wclear 55 67 88</code>, <code>!wclear 55-100</code>, or <code>!wclear all</code>
 
 <code>!wdone &lt;PR/MR reference&gt;</code>
