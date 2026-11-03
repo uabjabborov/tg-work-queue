@@ -12,7 +12,7 @@ A Telegram bot that manages task queues for GitLab/GitHub merge requests in chan
 | `!w` | List all tasks in the queue |
 | `!wme` | Privately show reviews assigned to you, and your PRs/MRs that were approved (ready to merge) or bounced |
 | `!wmerged <PR/MR reference>` | Mark one of your approved PRs/MRs as merged, so it leaves `!wme` |
-| `!wclear <PR/MR references>` / `!wclear all` | Clear your approved or bounced PRs/MRs from `!wme` |
+| `!wclear <PR/MR references>` / `!wclear all` | Clear your approved or bounced PRs/MRs from `!wme` (privately lists what was cleared) |
 | `!wdone <PR/MR reference>` | Remove a completed review |
 | `!wbounce <PR/MR reference>` | Remove a review with a "Changes required" comment in the chat |
 | `!wassign <PR/MR reference> @username [...]` | Assign or reassign a review (replaces all existing assignees) |
@@ -184,7 +184,7 @@ http://gitlab.example.com/group/backend/-/merge_requests/47
 # Clear several approved or bounced PRs/MRs from your !wme list at once
 !wclear 52, 55, 60-100
 
-# Response:
+# Private response (only you see it in a group):
 # 🧹 Cleared 3 from your !wme list
 # backend/52 — bounced by @bob on Oct 28
 # ...
@@ -315,13 +315,14 @@ It also lists the PRs/MRs you added that a reviewer finished, with who finished 
 
 - **Approved, ready to merge:** a reviewer ran `!wdone`. The bot can't see when you merge, so after merging send `!wmerged <PR/MR reference>` in the same chat to take it off your list. `!wmerged` only works on your own approved PRs/MRs. Running `!wdone` on your own PR/MR doesn't count as an approval. Marking a PR/MR as merged doesn't change the leaderboard.
 - **Need changes:** a reviewer ran `!wbounce`. It stays on your list until it's added to the queue again with `!wadd`, so re-add it once the changes are made.
-- **Clearing:** `!wclear` takes approved or bounced PRs/MRs off your list without touching the queue or the leaderboard. List references separated by spaces or commas (`!wclear 55, 67, 88`), give a PR/MR number range (`!wclear 55-100` or `!wclear 55..100`), or use `!wclear all`. In a group it clears that chat's entries; in a direct message with the bot it clears entries from every group you're still in. If a cleared PR/MR is approved or bounced again, it comes back. Reviews assigned to you can't be cleared; finish them with `!wdone` or `!wbounce`.
+- **Clearing:** `!wclear` takes approved or bounced PRs/MRs off your list without touching the queue or the leaderboard. List references separated by spaces or commas (`!wclear 55, 67, 88`), give a PR/MR number range (`!wclear 55-100` or `!wclear 55..100`), or use `!wclear all`. In a group it clears that chat's entries; in a direct message with the bot it clears entries from every group you're still in. If a cleared PR/MR is approved or bounced again, it comes back. Reviews assigned to you can't be cleared; finish them with `!wdone` or `!wbounce`. Like `!wme`, the list of what was cleared is a private reply.
 
 Only each PR/MR's latest outcome counts: re-adding one takes it off the list, and bouncing an approved one moves it to "need changes". Approvals and bounces older than 14 days are hidden, since by then the PR/MR was probably merged, closed, or replaced. They're matched to you by your Telegram account, so they appear even without a username. Approvals from before `!wmerged` existed are treated as already merged.
 
 - In groups the reply is a Telegram [ephemeral message](https://core.telegram.org/bots/api#ephemeral-messages-and-commands) (Bot API 10.2+): only you and the bot see it. Telegram may drop it if you are offline or after an app restart, so just send `!wme` again.
 - The bot must be a group **admin** to send ephemeral messages. Otherwise it replies with a short notice instead of posting your list publicly. If Telegram ever posts the reply publicly (for example, a self-hosted Bot API server without ephemeral support), the bot deletes it immediately.
-- Your `!wme` message itself stays visible to the group; only the reply is private.
+- `!wclear` clears before it replies, so if the private reply fails, the public notice still says how many PRs/MRs were cleared (without naming them). Sending `!wclear` again won't show them.
+- Your `!wme` or `!wclear` message itself stays visible to the group; only the reply is private. Usage and invalid-reference errors from `!wclear` are still public, since they don't list your PRs/MRs. When `!wmerged` matches several of your approved PRs/MRs, that list is private too.
 - In a direct message with the bot, `!wme` lists your reviews from all groups you're still a member of, as a normal reply, under each group's name. If Telegram can't confirm your membership in a group right now (for example, a timeout), the reply says so and you can send `!wme` again.
 
 ## Notes
