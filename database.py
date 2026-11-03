@@ -176,6 +176,15 @@ class Database:
                     INSERT OR IGNORE INTO merged_reviews (activity_id, merged_by, merged_at)
                     SELECT id, 'Unknown', ? FROM review_activity WHERE outcome = 'done'
                 """, (utc_timestamp(now),))
+            # Approved or bounced reviews their submitters cleared from !wme.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS cleared_reviews (
+                    activity_id INTEGER PRIMARY KEY REFERENCES review_activity(id),
+                    cleared_by TEXT NOT NULL,
+                    cleared_by_id INTEGER,
+                    cleared_at TEXT NOT NULL
+                )
+            """)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS leaderboard_users (
                     chat_id INTEGER NOT NULL,
@@ -366,8 +375,8 @@ class Database:
     def get_finished_reviews(self, user_id: Optional[int], name: Optional[str], since: datetime,
                              chat_id: Optional[int] = None) -> list[FinishedReview]:
         """Reviews this user submitted that are waiting on them: approved and not yet marked merged,
-        or bounced. Only each review's latest outcome after `since` counts, and reviews that were
-        queued again are left out. Approvals the user gave their own review are skipped.
+        or bounced, and not cleared. Only each review's latest outcome after `since` counts, and reviews
+        that were queued again are left out. Approvals the user gave their own review are skipped.
 
         Submitters are matched by user ID; entries saved before IDs were recorded match by name.
         """
@@ -377,6 +386,7 @@ class Database:
                 WHERE review_host IS NOT NULL AND completed_at >= ?
                   AND (? IS NULL OR chat_id = ?)
                   AND (created_by_id = ? OR (created_by_id IS NULL AND LOWER(created_by) = LOWER(?)))
+                  AND id NOT IN (SELECT activity_id FROM cleared_reviews)
                   AND (outcome = 'bounce' OR (
                       (completed_by_id IS NULL OR created_by_id IS NULL OR completed_by_id != created_by_id)
                       AND id NOT IN (SELECT activity_id FROM merged_reviews)
@@ -417,6 +427,15 @@ class Database:
                 INSERT OR IGNORE INTO merged_reviews (activity_id, merged_by, merged_by_id, merged_at)
                 VALUES (?, ?, ?, ?)
             """, (activity_id, merged_by, merged_by_id, utc_timestamp(now)))
+
+    def clear_finished_reviews(self, activity_ids: list[int], cleared_by: str, cleared_by_id: Optional[int] = None,
+                               now: Optional[datetime] = None) -> None:
+        timestamp = utc_timestamp(now)
+        with self._get_connection() as conn:
+            conn.executemany("""
+                INSERT OR IGNORE INTO cleared_reviews (activity_id, cleared_by, cleared_by_id, cleared_at)
+                VALUES (?, ?, ?, ?)
+            """, [(activity_id, cleared_by, cleared_by_id, timestamp) for activity_id in activity_ids])
 
     def _row_to_task(self, conn: sqlite3.Connection, row: sqlite3.Row) -> Task:
         assignees = self._get_task_assignees(conn, row["id"])

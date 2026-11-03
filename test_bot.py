@@ -206,6 +206,62 @@ class QueueReferenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reminder["parse_mode"], "HTML")
         self.assertTrue(reminder["disable_web_page_preview"])
 
+    async def test_wadd_adds_several_links_with_per_group_assignees(self):
+        urls = [f"https://github.com/owner/repo/pull/{number}" for number in (1, 2, 3, 4, 5)]
+        self.add_task(task_id="repo/4")
+
+        reply = await self.send_command(
+            f"!WADD {urls[0]} {urls[1]}, @alice @bob\n{urls[2]} @carol {urls[3]}\n{urls[4]}"
+        )
+
+        tasks = {task.task_id: task.assignees for task in self.db.get_tasks(1)}
+        self.assertEqual(tasks, {
+            "repo/4": ["@reviewer"],
+            "repo/1": ["@alice", "@bob"], "repo/2": ["@alice", "@bob"],
+            "repo/3": ["@carol"], "repo/5": [],
+        })
+        self.assertEqual(reply.args[0], (
+            "<b>Added 4 of 5</b>\n"
+            f'<a href="{urls[0]}">repo/1</a> → @alice, @bob\n'
+            f'<a href="{urls[1]}">repo/2</a> → @alice, @bob\n'
+            f'<a href="{urls[2]}">repo/3</a> → @carol\n'
+            f'<a href="{urls[4]}">repo/5</a>\n'
+            "Already in the queue: repo/4"
+        ))
+        self.assertEqual(reply.kwargs["parse_mode"], "HTML")
+
+    async def test_wadd_assigns_mentions_on_the_next_line_and_keeps_commas_in_urls(self):
+        url = "https://github.com/owner/repo/pull/1?diff=split,w=1"
+        reply = await self.send_command(f"!wadd {url},\n@alice,@bob\nhttps://github.com/owner/repo/pull/2")
+
+        tasks = self.db.get_tasks(1)
+        self.assertEqual([(task.url, task.assignees) for task in tasks], [
+            (url, ["@alice", "@bob"]), ("https://github.com/owner/repo/pull/2", []),
+        ])
+        self.assertIn("<b>Added 2</b>", reply.args[0])
+
+    async def test_wadd_reports_a_single_existing_link_as_before(self):
+        self.add_task(task_id="repo/4")
+        reply = await self.send_command("!wadd https://github.com/owner/repo/pull/4 @alice")
+        self.assertEqual(reply.args[0], "PR/MR reference repo/4 already exists in the queue.")
+
+    async def test_wadd_adds_nothing_when_any_argument_is_invalid(self):
+        url = "https://github.com/owner/repo/pull/1"
+        cases = (
+            ("!wadd", "Missing URL"),
+            ("!wadd @alice", "Missing URL"),
+            (f"!wadd @alice\n{url}", "Missing URL"),
+            (f"!wadd {url} https://github.com/owner/repo/issues/2", "Unsupported URL"),
+            (f"!wadd {url} github.com/owner/repo/pull/2", "Invalid URL"),
+            (f"!wadd {url} @al-ice", "Invalid username format"),
+            (f"!wadd {url} <b>", "Invalid URL <code>&lt;b&gt;</code>"),
+        )
+        for text, expected in cases:
+            with self.subTest(text=text):
+                reply = await self.send_command(text)
+                self.assertIn(expected, reply.args[0])
+                self.assertEqual(self.db.get_tasks(1), [])
+
     async def test_missing_references_show_updated_usage(self):
         for command in ("wdone", "wbounce", "wassign"):
             with self.subTest(command=command):
@@ -512,7 +568,8 @@ class WmeCommandTests(unittest.IsolatedAsyncioTestCase):
             f'<a href="https://github.com/owner/repo/pull/52">repo/52</a> — bounced by @bob on '
             f'{now.astimezone(TASHKENT).strftime("%b %d")}\n'
             "<i>Re-add one with <code>!wadd</code> once it's fixed.</i>\n"
-            "<i>Approvals and bounces older than 14 days are hidden.</i>"
+            "<i>Approvals and bounces older than 14 days are hidden. Clear them sooner with "
+            "<code>!wclear &lt;PR/MR references&gt;</code> or <code>!wclear all</code>.</i>"
         ))
 
     async def test_wme_in_private_chat_warns_when_groups_could_not_be_checked(self):
@@ -666,6 +723,110 @@ class WmeCommandTests(unittest.IsolatedAsyncioTestCase):
             await self.command("!wadd https://github.com/owner/repo/pull/7 @bob")
             await self.command("!wdone 7", username="bob", user_id=8)
             self.assertIn("ready to merge (1)", await self.wme_reply())
+
+    async def finish(self, numbers, outcome="wdone", repo="repo", chat_id=1):
+        for number in numbers:
+            await self.command(f"!wadd https://github.com/owner/{repo}/pull/{number} @bob", chat_id=chat_id)
+            await self.command(f"!{outcome} {repo}/{number}", username="bob", user_id=8, chat_id=chat_id)
+
+    async def test_wclear_clears_lists_and_ranges_of_approved_and_bounced_reviews(self):
+        await self.finish((55, 67, 88, 100, 101))
+        await self.finish((70, 120), outcome="wbounce")
+        self.add_task(90, ["@alice"])
+
+        update, _ = await self.command("!WCLEAR 55, 67 70\n88..100 999 90")
+
+        reply = update.message.reply_text.await_args.args[0]
+        self.assertTrue(reply.startswith("🧹 <b>Cleared 5 from your <code>!wme</code> list</b>\n"))
+        for number in (55, 67, 70, 88, 100):
+            self.assertIn(f">repo/{number}</a>", reply)
+        self.assertIn("Not among your approved or bounced PRs/MRs: <code>999</code>, <code>90</code>", reply)
+        wme = await self.wme_reply()
+        self.assertIn("ready to merge (1)", wme)
+        self.assertIn(">repo/101</a>", wme)
+        self.assertIn("need changes (1)", wme)
+        self.assertIn(">repo/120</a>", wme)
+        self.assertIn("Assigned to you (1)", wme)
+        self.assertEqual([task.task_id for task in self.db.get_tasks(1)], ["repo/90"])
+
+        # A cleared review comes back when it is bounced again.
+        await self.finish((70,), outcome="wbounce")
+        self.assertIn(">repo/70</a>", await self.wme_reply())
+
+    async def test_wclear_all_clears_only_the_senders_reviews_in_this_chat(self):
+        await self.finish((5, 6))
+        await self.finish((7,), outcome="wbounce")
+        await self.finish((8,), chat_id=2)
+        await self.command("!wadd https://github.com/owner/repo/pull/9 @alice", username="carol", user_id=9)
+        await self.command("!wbounce 9", username="bob", user_id=8)
+        before = bot.format_leaderboard(bot.build_leaderboard(self.db, 1, bot.reporting_week()))
+
+        update, _ = await self.command("!wclear ALL")
+
+        self.assertIn("Cleared 3", update.message.reply_text.await_args.args[0])
+        self.assertNotIn("repo/", await self.wme_reply())
+        self.assertIn(">repo/8</a>", await self.wme_reply(chat_id=2))
+        self.assertIn(">repo/9</a>", await self.wme_reply(username="carol", user_id=9))
+        self.assertEqual(bot.format_leaderboard(bot.build_leaderboard(self.db, 1, bot.reporting_week())), before)
+
+        update, _ = await self.command("!wclear all")
+        self.assertIn("Nothing to clear", update.message.reply_text.await_args.args[0])
+
+    async def test_wclear_rejects_bad_ambiguous_and_anonymous_requests(self):
+        for repo in ("api", "web"):
+            await self.finish((5,), repo=repo)
+
+        cases = (
+            ("!wclear", "Usage: <code>!wclear"),
+            ("!wclear , ,", "Usage: <code>!wclear"),
+            ("!wclear 5 #6", "Invalid PR/MR reference <code>#6</code>"),
+            ("!wclear 5", "matches several of your PRs/MRs"),
+        )
+        for text, expected in cases:
+            with self.subTest(text=text):
+                update, _ = await self.command(text)
+                self.assertIn(expected, update.message.reply_text.await_args.args[0])
+        anonymous = self.make_update("!wclear all", anonymous=True)
+        await self.send(anonymous)
+        self.assertIn("anonymously", anonymous.message.reply_text.await_args.args[0])
+        self.assertIn("ready to merge (2)", await self.wme_reply())
+
+        # A range takes every matching PR/MR, and huge numbers don't break the comparison.
+        update, _ = await self.command(f"!wclear 1-{'9' * 5000}")
+        self.assertIn("Cleared 2", update.message.reply_text.await_args.args[0])
+
+    async def test_wclear_in_private_chat_clears_groups_the_sender_is_in(self):
+        for chat_id in (-100, -200, -300):
+            await self.finish((5,), chat_id=chat_id)
+        update = self.make_update("!wclear repo/5", chat_type="private", chat_id=7)
+
+        await self.send(update, self.make_bot(member_statuses={-200: "left", -300: TimedOut()}))
+
+        reply = update.message.reply_text.await_args.args[0]
+        self.assertIn("Cleared 1", reply)
+        self.assertIn("couldn't check 1 of your groups", reply)
+        self.assertNotIn("repo/5", await self.wme_reply(chat_id=-100))
+        self.assertIn("repo/5", await self.wme_reply(chat_id=-200))
+        self.assertIn("repo/5", await self.wme_reply(chat_id=-300))
+
+    async def test_wclear_in_private_chat_names_groups_and_keeps_same_named_repos_apart(self):
+        await self.finish((5,), chat_id=-100)
+        await self.finish((5,), chat_id=-200)
+        await self.command("!wadd https://gitlab.example.com/team/repo/-/merge_requests/5 @bob", chat_id=-300)
+        await self.command("!wdone repo/5", username="bob", user_id=8, chat_id=-300)
+
+        ambiguous = self.make_update("!wclear repo/5", chat_type="private", chat_id=7)
+        await self.send(ambiguous)
+        self.assertIn("matches several of your PRs/MRs", ambiguous.message.reply_text.await_args.args[0])
+        self.assertIn("repo/5", await self.wme_reply(chat_id=-300))
+
+        update = self.make_update("!wclear https://github.com/owner/repo/pull/5", chat_type="private", chat_id=7)
+        await self.send(update)
+        reply = update.message.reply_text.await_args.args[0]
+        self.assertIn("Cleared 2", reply)
+        self.assertIn("<i>Team -100</i>", reply)
+        self.assertIn("<i>Team -200</i>", reply)
+        self.assertIn("repo/5", await self.wme_reply(chat_id=-300))
 
     def test_visible_length_ignores_markup_and_counts_like_telegram(self):
         self.assertEqual(visible_length('<a href="https://example.com/very/long">repo/1</a> &lt;b&gt;'), 10)

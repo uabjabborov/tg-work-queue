@@ -84,7 +84,8 @@ def my_reviews(assigned: list["Task"], finished: list["FinishedReview"], has_use
         blocks += grouped_by_chat(bounced, finished_listing, chat_titles)
         blocks.append("<i>Re-add one with <code>!wadd</code> once it's fixed.</i>")
     if finished:
-        blocks.append(f"<i>Approvals and bounces older than {FINISHED_VISIBLE_DAYS} days are hidden.</i>")
+        blocks.append(f"<i>Approvals and bounces older than {FINISHED_VISIBLE_DAYS} days are hidden. "
+                      "Clear them sooner with <code>!wclear &lt;PR/MR references&gt;</code> or <code>!wclear all</code>.</i>")
     if unchecked_chats:
         groups = "1 of your groups" if unchecked_chats == 1 else f"{unchecked_chats} of your groups"
         blocks.append(f"\n⚠️ I couldn't check {groups} right now, so some reviews may be missing. "
