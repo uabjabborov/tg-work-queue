@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py database.py presentation.py review_urls.py leaderboard.py scheduler.py ./
+COPY bot.py chat_dispatcher.py database.py presentation.py review_urls.py review_metadata.py github_app.py github_commands.py leaderboard.py scheduler.py ./
 
 # Catch missing runtime modules before an image can be published.
 RUN python -c "import os, tempfile; \

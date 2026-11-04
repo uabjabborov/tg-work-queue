@@ -663,6 +663,9 @@ class LeaderboardCommandTests(DatabaseFixture, unittest.IsolatedAsyncioTestCase)
         poll.assert_called_once_with(allowed_updates=bot.Update.ALL_TYPES)
         self.assertIs(built_apps[0].post_init, bot.post_init)
         self.assertIs(built_apps[0].post_stop, bot.post_stop)
+        handler = built_apps[0].handlers[0][0]
+        self.assertIs(handler.callback, bot.dispatch_message)
+        self.assertFalse(handler.block)
 
     async def test_real_scheduler_starts_and_stops_on_the_application_event_loop(self):
         application = SimpleNamespace(bot_data={})

@@ -12,9 +12,13 @@ from telegram.error import BadRequest, Forbidden, TelegramError, TimedOut
 from html import escape as html_escape
 
 from database import Database, FinishedReview, Task
+from chat_dispatcher import ChatDispatcher
+from github_commands import handle_github_command
 from leaderboard import build_leaderboard, format_leaderboard, reporting_week
 from presentation import FINISHED_VISIBLE_DAYS, finished_listing, grouped_by_chat, my_reviews, review_link, split_messages, task_listing
 from review_urls import normalize_review_number, parse_review_url
+from review_metadata import refresh_review_metadata
+from presentation import review_heading
 from scheduler import add_reminder_job, remove_reminder_job, setup_scheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -34,6 +38,8 @@ db = Database()
 # Regex patterns for commands
 WADD_PREFIX = re.compile(r"^!wadd\b", re.IGNORECASE)
 W_PATTERN = re.compile(r"^!w$", re.IGNORECASE)
+WD_PATTERN = re.compile(r"^!wd$", re.IGNORECASE)
+WGITHUB_PATTERN = re.compile(r"^!wgithub\b", re.IGNORECASE)
 WME_PATTERN = re.compile(r"^!wme$", re.IGNORECASE)
 WMERGED_PATTERN = re.compile(r"^!wmerged\s+(.+)$", re.IGNORECASE)
 WMERGED_PREFIX = re.compile(r"^!wmerged\b", re.IGNORECASE)
@@ -54,6 +60,12 @@ WLEADERBOARD_PATTERN = re.compile(r"^!wleaderboard(?:\s+(last))?$", re.IGNORECAS
 WLEADERBOARD_OFF_PATTERN = re.compile(r"^!wleaderboard-off$", re.IGNORECASE)
 WLEADERBOARD_ON_PATTERN = re.compile(r"^!wleaderboard-on$", re.IGNORECASE)
 WLEADERBOARD_PREFIX = re.compile(r"^!wleaderboard\b", re.IGNORECASE)
+COMMAND_PATTERNS = (
+    WADD_PREFIX, W_PATTERN, WD_PATTERN, WGITHUB_PATTERN, WME_PATTERN,
+    WMERGED_PREFIX, WCLEAR_PREFIX, WDONE_PREFIX, WBOUNCE_PREFIX, WHELP_PATTERN,
+    WREMINDER_STATUS_PATTERN, WREMINDER_SET_PATTERN, WREMINDER_OFF_PATTERN,
+    WREMINDER_REMOVE_PATTERN, WASSIGN_PREFIX, WLEADERBOARD_PREFIX,
+)
 
 QUALIFIED_REFERENCE_PATTERN = re.compile(r"[^/\s]+/[0-9]+")
 NUMBER_PATTERN = re.compile(r"[0-9]+")
@@ -200,6 +212,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat_id = update.effective_chat.id
     
     created_by_id, created_by = sender_identity(update)
+
+    if WGITHUB_PATTERN.match(text):
+        await handle_github_command(update, context, db, reply_privately)
+        return
     
     # Check for !wadd command
     if WADD_PREFIX.match(text):
@@ -213,6 +229,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Check for !w command
     if W_PATTERN.match(text):
         await handle_w(update, chat_id)
+        return
+
+    if WD_PATTERN.match(text):
+        await handle_wd(update, context, chat_id)
         return
 
     if WME_PATTERN.match(text):
@@ -342,16 +362,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def handle_wadd(update: Update, chat_id: int, reviews: list[tuple[str, str, list[str]]], created_by: str,
                       created_by_id: int | None = None) -> None:
     """Handle !wadd command - add tasks from one or more MR/PR links."""
-    added, existing = [], []
+    added_ids, existing = set(), []
     for task_id, url, assignees in reviews:
         if db.add_task(chat_id, task_id, url, assignees, created_by, created_by_id) is None:
             existing.append(task_id)
             continue
-        entry = review_link(task_id, url)
-        if assignees:
-            entry += " → " + ", ".join(html_escape(a) for a in assignees)
-        added.append(entry)
+        added_ids.add(task_id)
         logger.info(f"Added task {task_id} in chat {chat_id}: {url} -> {', '.join(assignees) or 'unassigned'}")
+
+    added_tasks = [task for task in db.get_tasks(chat_id) if task.task_id in added_ids]
+    await refresh_review_metadata(db, added_tasks)
+    added = []
+    for task in added_tasks:
+        entry = review_heading(task)
+        if task.assignees:
+            entry += " → " + ", ".join(html_escape(a) for a in task.assignees)
+        added.append(entry)
 
     if len(reviews) == 1:
         response = added or [f"PR/MR reference {html_escape(existing[0])} already exists in the queue."]
@@ -372,8 +398,32 @@ async def handle_w(update: Update, chat_id: int) -> None:
         await update.message.reply_text("No tasks in the queue.")
         return
     
-    response = "\n".join(task_listing(task) for task in tasks)
-    await update.message.reply_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    await refresh_review_metadata(db, tasks)
+    for response in split_messages([task_listing(task) for task in tasks]):
+        await update.message.reply_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+async def handle_wd(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """Show this chat's entire queue with descriptions privately, then remove the group command."""
+    try:
+        user_id, _ = sender_identity(update)
+        if user_id is None:
+            await update.message.reply_text(
+                "<code>!wd</code> needs to know who you are. Send it from your own account, not anonymously.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        tasks = db.get_tasks(chat_id)
+        await refresh_review_metadata(db, tasks)
+        texts = split_messages([task_listing(task, include_description=True) for task in tasks])
+        await reply_privately(update, context, texts or ["No tasks in the queue."], verify_private=True)
+    finally:
+        if update.effective_chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+            try:
+                await context.bot.delete_message(chat_id, update.message.message_id)
+            except TelegramError as error:
+                # A missing delete permission must not prevent the private queue from being shown.
+                logger.warning("Could not delete !wd command in chat %s: %r", chat_id, error)
 
 
 async def visible_reviews(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int,
@@ -410,8 +460,9 @@ async def handle_wme(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id
         return
 
     assigned, finished, chat_titles, unchecked = await visible_reviews(update, context, chat_id, user_id)
+    await refresh_review_metadata(db, [*assigned, *finished])
     await reply_privately(update, context, my_reviews(assigned, finished, has_username=bool(update.effective_user.username),
-                                                      chat_titles=chat_titles, unchecked_chats=unchecked))
+                                                      chat_titles=chat_titles, unchecked_chats=unchecked), verify_private=True)
 
 
 async def handle_wmerged(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, task_ref: str) -> None:
@@ -569,17 +620,30 @@ async def member_chat_titles(context: ContextTypes.DEFAULT_TYPE, chat_ids: set[i
 
 
 async def reply_privately(update: Update, context: ContextTypes.DEFAULT_TYPE, texts: list[str],
-                          public_outcome: str | None = None) -> bool:
+                          public_outcome: str | None = None, verify_private: bool = False) -> bool:
     """Reply so only the sender sees it; in private chats a normal reply is already private.
 
     Commands that change data pass public_outcome, a summary without any PR/MR links that is posted
     publicly if the private reply fails, since sending such a command again can't recover the reply.
     Returns whether the whole reply was delivered privately.
+    `verify_private` sends only a neutral placeholder through sendMessage, then fills it using
+    the ephemeral-only edit method. Servers that ignore unknown parameters never get the details
+    in a request that could create a public message.
     """
+    texts = [chunk for text in texts for chunk in split_messages([text])]
     chat = update.effective_chat
     if chat.type == ChatType.PRIVATE:
-        for text in texts:
-            await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        try:
+            for text in texts:
+                await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        except TelegramError as error:
+            logger.warning("Could not send private chat reply in chat %s (%s)", chat.id, type(error).__name__)
+            if public_outcome:
+                try:
+                    await update.message.reply_text(public_outcome, parse_mode=ParseMode.HTML)
+                except TelegramError:
+                    logger.warning("Could not deliver action outcome in chat %s", chat.id)
+            return False
         return True
 
     # Ephemeral messages (Bot API 10.2+) are not wrapped by python-telegram-bot yet. Admin bots
@@ -588,7 +652,8 @@ async def reply_privately(update: Update, context: ContextTypes.DEFAULT_TYPE, te
         prefix = ("Only part of my reply reached you. " if index else "") + (f"{public_outcome} " if public_outcome else "")
         try:
             sent = await context.bot.send_message(
-                chat.id, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+                chat.id, "Preparing your private reply…" if verify_private else text,
+                parse_mode=ParseMode.HTML, disable_web_page_preview=True,
                 message_thread_id=update.message.message_thread_id if update.message.is_topic_message else None,
                 api_kwargs={"ephemeral_message_parameters": {"receiver_user_id": update.effective_user.id}},
             )
@@ -610,6 +675,33 @@ async def reply_privately(update: Update, context: ContextTypes.DEFAULT_TYPE, te
                 notice += " My reply was posted publicly and I couldn't delete it, so please delete it."
             await update.message.reply_text(prefix + notice, parse_mode=ParseMode.HTML)
             return False
+        if verify_private:
+            # PTB 21.3 retains these newer Telegram fields in api_kwargs.
+            ephemeral_id = sent.api_kwargs.get("ephemeral_message_id")
+            receiver = sent.api_kwargs.get("receiver_user", {})
+            if (not isinstance(ephemeral_id, int) or not isinstance(receiver, dict)
+                    or receiver.get("id") != update.effective_user.id):
+                await update.message.reply_text(
+                    prefix + "I couldn't confirm a private reply, so I haven't sent the details.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return False
+            try:
+                edited = await context.bot._post("editEphemeralMessageText", data={
+                    "chat_id": chat.id,
+                    "receiver_user_id": update.effective_user.id,
+                    "ephemeral_message_id": ephemeral_id,
+                    "text": text,
+                    "parse_mode": ParseMode.HTML,
+                    "link_preview_options": {"is_disabled": True},
+                })
+                if edited is not True:
+                    raise TelegramError("Private edit was not confirmed")
+            except TelegramError as error:
+                logger.warning("Could not edit private queue reply in chat %s: %r", chat.id, error)
+                failure = await private_reply_failure(context, chat.id, error, can_resend=public_outcome is None)
+                await update.message.reply_text(prefix + failure, parse_mode=ParseMode.HTML)
+                return False
     return True
 
 
@@ -700,8 +792,15 @@ Examples:
 <code>!w</code>
 List all tasks in the queue
 
+<code>!wd</code>
+Show this chat's full queue with description previews only to you. The bot tries to delete your command from the group (requires Delete Messages permission).
+
 <code>!wme</code>
 Privately show reviews assigned to you, and your PRs/MRs that were approved (ready to merge) or bounced (only you see the reply; the bot must be a group admin)
+Includes GitHub PR titles and description previews when available.
+
+<code>!wgithub</code>
+Manage this chat's GitHub App connections for private repositories (chat admins only).
 
 <code>!wmerged &lt;PR/MR reference&gt;</code>
 Mark one of your approved PRs/MRs as merged, so it leaves <code>!wme</code>
@@ -923,8 +1022,9 @@ async def handle_wassign(update: Update, chat_id: int, task_ref: str, assignees:
     else:
         response += " (unassigned)"
     
-    await update.message.reply_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    
+    for text in split_messages([response]):
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
     assignees_log = ", ".join(assignees) if assignees else "unassigned"
     logger.info(f"Assigned task {updated_task.task_id} to {assignees_log} in chat {chat_id}")
 
@@ -940,6 +1040,24 @@ async def post_stop(application: Application) -> None:
         scheduler.shutdown(wait=False)
 
 
+async def dispatch_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat is None or update.message is None:
+        return
+    text = (update.message.text or "").strip()
+    if not any(pattern.match(text) for pattern in COMMAND_PATTERNS):
+        return
+    dispatcher = context.bot_data.get("chat_dispatcher")
+    if dispatcher is None:
+        dispatcher = context.bot_data["chat_dispatcher"] = ChatDispatcher()
+    await dispatcher.run(
+        update.effective_chat.id,
+        lambda: handle_message(update, context),
+        lambda: update.message.reply_text(
+            "This chat has several commands waiting. Additional commands were not queued; please resend them later."
+        ),
+    )
+
+
 def main() -> None:
     """Start the bot."""
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -953,7 +1071,7 @@ def main() -> None:
     
     # Add message handler for all text messages
     application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+        MessageHandler(filters.TEXT & ~filters.COMMAND, dispatch_message, block=False)
     )
     
     # Start polling
