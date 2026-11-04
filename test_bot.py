@@ -20,11 +20,17 @@ with patch.object(Database, "_init_db"):
 
 def private_reply(telegram_bot):
     """Join the ephemeral messages the bot sent in a group."""
-    return "\n".join(call.args[1] for call in telegram_bot.send_message.await_args_list)
+    texts = [call.args[1] for call in telegram_bot.send_message.await_args_list
+             if call.args[1] != "Preparing your private reply…"]
+    texts += [call.kwargs["data"]["text"] for call in telegram_bot._post.await_args_list]
+    return "\n".join(texts)
 
 
 class QueueReferenceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        metadata_patch = patch.object(bot, "refresh_review_metadata", new_callable=AsyncMock)
+        metadata_patch.start()
+        self.addCleanup(metadata_patch.stop)
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
         self.db = Database(str(Path(temp_dir.name) / "workqueue.db"))
@@ -295,6 +301,9 @@ class QueueReferenceTests(unittest.IsolatedAsyncioTestCase):
 
 class WmeCommandTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        metadata_patch = patch.object(bot, "refresh_review_metadata", new_callable=AsyncMock)
+        metadata_patch.start()
+        self.addCleanup(metadata_patch.stop)
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
         self.db = Database(str(Path(temp_dir.name) / "workqueue.db"))
@@ -320,6 +329,12 @@ class WmeCommandTests(unittest.IsolatedAsyncioTestCase):
         )
 
     def make_bot(self, send_message=None, bot_status="administrator", member_statuses=None):
+        async def ephemeral(chat_id, text, **kwargs):
+            return SimpleNamespace(message_id=0, api_kwargs={
+                "ephemeral_message_id": 123,
+                "receiver_user": {"id": kwargs["api_kwargs"]["ephemeral_message_parameters"]["receiver_user_id"]},
+            })
+
         def chat_member(chat_id, user_id):
             if user_id == 99:
                 return SimpleNamespace(status=bot_status)
@@ -331,7 +346,8 @@ class WmeCommandTests(unittest.IsolatedAsyncioTestCase):
         return SimpleNamespace(
             id=99,
             # Telegram returns message ID 0 for ephemeral messages.
-            send_message=send_message or AsyncMock(return_value=SimpleNamespace(message_id=0)),
+            send_message=send_message or AsyncMock(side_effect=ephemeral),
+            _post=AsyncMock(return_value=True),
             delete_message=AsyncMock(),
             get_chat_member=AsyncMock(side_effect=chat_member),
             get_chat=AsyncMock(side_effect=lambda chat_id: SimpleNamespace(title=f"Team {chat_id}")),
@@ -358,7 +374,7 @@ class WmeCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["message_thread_id"], 55)
         self.assertEqual(kwargs["parse_mode"], "HTML")
         self.assertTrue(kwargs["disable_web_page_preview"])
-        self.assertEqual(args[1], (
+        self.assertEqual(private_reply(telegram_bot), (
             "<b>Assigned to you (2)</b>\n"
             f'<a href="{mine}">repo/1</a> → @alice, @bob (by @author)\n'
             '<a href="https://github.com/owner/repo/pull/3">repo/3</a> → @ALICE (by @author)'
@@ -373,7 +389,7 @@ class WmeCommandTests(unittest.IsolatedAsyncioTestCase):
 
         telegram_bot = await self.send(update)
 
-        messages = [call.args[1] for call in telegram_bot.send_message.await_args_list]
+        messages = [call.kwargs["data"]["text"] for call in telegram_bot._post.await_args_list]
         self.assertGreater(len(messages), 1)
         self.assertTrue(all(visible_length(message) <= 4096 for message in messages))
         self.assertEqual(sum(message.count("(by @author)") for message in messages), 300)
@@ -385,7 +401,7 @@ class WmeCommandTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(username=username):
                 update = self.make_update("!wme", username=username)
                 telegram_bot = await self.send(update)
-                self.assertIn(expected, telegram_bot.send_message.await_args.args[1])
+                self.assertIn(expected, private_reply(telegram_bot))
                 self.assertIn("ephemeral_message_parameters", telegram_bot.send_message.await_args.kwargs["api_kwargs"])
                 update.message.reply_text.assert_not_awaited()
 
@@ -616,7 +632,8 @@ class WmeCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_wme_reports_a_partially_delivered_reply(self):
         for number in range(1, 301):
             self.add_task(number, ["@alice", "@" + "b" * 30])
-        send_message = AsyncMock(side_effect=[SimpleNamespace(message_id=0), TimedOut()])
+        send_message = AsyncMock(side_effect=[SimpleNamespace(message_id=0, api_kwargs={
+            "ephemeral_message_id": 123, "receiver_user": {"id": 7}}), TimedOut()])
         update = self.make_update("!wme")
 
         await self.send(update, self.make_bot(send_message))
