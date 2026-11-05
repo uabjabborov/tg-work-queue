@@ -1,9 +1,0 @@
-.git
-.context
-.env
-.venv
-__pycache__
-workqueue.db*
-data
-secrets
-*.pem

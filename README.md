@@ -10,8 +10,6 @@ A Telegram bot that manages task queues for GitLab/GitHub merge requests in chan
 |---------|-------------|
 | `!wadd <MR/PR URL> [...] [@username ...]` | Add one or more merge requests (optionally assign to one or more users) |
 | `!w` | List all tasks in the queue |
-| `!wd` | Privately show this chat's full queue with description previews; try to delete the command from the group |
-| `!wgithub` | Manage this chat's GitHub App repository connections (chat admins only) |
 | `!wme` | Privately show reviews assigned to you, and your PRs/MRs that were approved (ready to merge) or bounced |
 | `!wmerged <PR/MR reference>` | Mark one of your approved PRs/MRs as merged, so it leaves `!wme` |
 | `!wclear <PR/MR references>` / `!wclear all` | Clear your approved or bounced PRs/MRs from `!wme` (privately lists what was cleared) |
@@ -78,88 +76,7 @@ Create a `.env` file with your bot token:
 TELEGRAM_BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
 ```
 
-Public GitHub PR titles and descriptions are fetched automatically without repository credentials
-([GitHub pull request API](https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request)).
-No GitHub or GitLab token is needed. The bot deliberately does not read `GITHUB_TOKEN`, `GH_TOKEN`,
-`GITLAB_URL`, or `GITLAB_TOKEN` for metadata: a public bot must not share one team's repository
-access with unrelated groups.
-
-Private repositories on **github.com** work through per-chat GitHub App connections, configured
-below. GitLab MRs still work in the queue, but their metadata integration is deferred to a separate
-change. There is no global repository-token fallback.
-
-Metadata requests go only to `https://api.github.com`, with TLS verification enabled and redirects
-disabled. Public requests use GitHub's unauthenticated rate limits; connected repositories use App
-installation access. GitHub device authorization uses `https://github.com`. No callback website,
-webhook endpoint, or additional service is needed.
-
-#### Optional: private repositories with a GitHub App
-
-The bot operator registers one public GitHub App. Teams install it on their own selected repositories
-and authorize those repositories for individual Telegram chats.
-
-1. [Register a GitHub App](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app).
-   Set **Pull requests: Read-only** repository permission (Metadata read access is included).
-   Request no write or organization permissions. Allow installation on **Any account**.
-2. Enable **Device Flow**. Leave **Request user authorization (OAuth) during installation** disabled;
-   the bot handles authorization through device codes instead. Webhooks can be disabled.
-3. Generate a private key. Store it as `secrets/github-app.pem`, restrict its file permissions, and
-   add these operator settings to `.env`:
-
-   ```dotenv
-   GITHUB_APP_ID=123456
-   GITHUB_APP_PRIVATE_KEY_FILE=/app/secrets/github-app.pem
-   ```
-
-   Docker Compose mounts `./secrets` read-only. For a direct Python deployment, use the actual local
-   PEM path. Keep the key out of source control and image build contexts; both are ignored here.
-   Restart the bot after changing App configuration or rotating its signing key.
-
-The App key identifies the service; it is not a team member's personal repository token. It is still
-a privileged deployment secret and must be protected. Only validated chat/repository bindings are
-used to request installation tokens; each token is restricted to one repository ID and read-only
-pull-request permission. [GitHub App authentication](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-as-a-github-app-installation)
-
-For each team, an administrator sends this in the target Telegram group:
-
-```text
-!wgithub connect owner/repo
-```
-
-The bot privately sends an installation link and a short-lived device code. Install the App on the
-selected repository, enter the code at `https://github.com/login/device`, then send:
-
-```text
-!wgithub finish
-```
-
-The same person must be both a Telegram group administrator and a GitHub administrator of that
-repository. Read access alone is insufficient. Finishing explicitly allows **all current and future
-members of that chat** to see PR titles and descriptions from this repository. This is a team grant,
-not individual GitHub permission checking for every Telegram reader. Connect only appropriate groups.
-In a direct message, the connection belongs to that private conversation; it does not grant access
-to group queues. Repeat the flow for each repository a chat needs.
-
-`!wgithub` lists connections privately. `!wgithub cancel` cancels your pending device flow.
-`!wgithub disconnect owner/repo` removes only that chat's binding and clears its metadata cache.
-It does not remove the GitHub installation or previously sent Telegram messages. To revoke access
-for all chats, remove the repository from the App installation, suspend it, or uninstall it on GitHub.
-If a connect, disconnect, or cancellation succeeds but its private confirmation fails, the bot posts
-the action's outcome without repository names. Use `!wgithub` to check the current connections.
-
-Device flows are bound to the initiating Telegram user and chat, expire within 15 minutes, and are
-lost on bot restart. If GitHub asks you to wait, finish authorization there and run `!wgithub finish`
-again after a few seconds. Org approval or SAML sign-in may be needed before GitHub grants access.
-[GitHub device authorization](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app#using-the-device-flow-to-generate-a-user-access-token)
-
-SQLite stores repository/installation IDs and who authorized the binding, never GitHub access or
-refresh tokens. Device codes and access tokens remain in memory only. Metadata from connected
-repositories is fetched afresh and is **not persisted**: failures or revoked GitHub access show just
-the queue link instead of stale private details. Reminders also recheck access before showing titles.
-
 ### 3. Install Dependencies
-
-Use Python 3.11 or later (the Docker image includes Python 3.11).
 
 ```bash
 pip install -r requirements.txt
@@ -390,52 +307,9 @@ Reminders use 5-part cron expressions in UTC timezone:
 
 Put several links in one `!wadd`, separated by spaces, commas, or new lines. `@username`s assign the links before them on the same line, back to the previous `@username`s, so each line can have its own reviewers and links with no `@username` after them stay unassigned. A line of only `@username`s assigns the line before it. If any link or username is invalid, nothing is added. Links already in the queue are skipped and listed in the reply.
 
-## Private Queue (`!wd`)
-
-Send `!wd` in a group to see the same pending reviews as `!w`, including titles, assignees,
-submitters, and description previews. It includes all queued reviews in that chat, not just your
-assignments. Only the requester receives the details. Long queues are split into private messages.
-In a direct message, `!wd` shows that conversation's queue, just like `!w`.
-
-The bot must be a group admin to send the private response. It first creates a neutral placeholder
-and checks Telegram's private-message identifiers, then fills it using the
-[ephemeral-only edit method](https://core.telegram.org/bots/api#editephemeralmessagetext).
-If private replies are unsupported or delivery fails, it reports an error without posting queue
-details publicly. No descriptions are sent as a public fallback.
-
-After handling `!wd`, the bot tries to delete the command from the group. Give it **Delete Messages**
-permission in supergroups ([Telegram deletion permissions](https://core.telegram.org/bots/api#deletemessage)).
-If deletion fails, the private response still works and the command remains visible. The command
-can be seen before deletion; deleting it cannot retract notifications or anything already seen.
-Commands in direct messages are kept.
-
 ## Private Replies (`!wme`)
 
 `!wme` lists the reviews in the current chat whose assignees include your `@username`. Matching ignores case. Long lists are split across several messages.
-
-`!wadd` automatically fetches titles and descriptions from public GitHub PRs and this chat's connected
-repositories. The add confirmation, `!w`, and
-scheduled reminders show titles only. Request `!wd` for the full queue or `!wme` for your reviews to see description previews privately,
-including approved and bounced items: in a group, the reply is addressed only to the command sender;
-in a direct message, it stays in that private conversation. Failed private delivery produces only
-an explanatory notice in the group, without description content.
-Descriptions appear as escaped plain text (Markdown source), with previews capped at 1,200 UTF-16
-units and titles at 240; follow the PR/MR link for the full content. Public details are cached in SQLite
-for five minutes and refreshed on `!w`, `!wd`, `!wme`, or a new `!wadd`. Existing queue entries are enriched
-on their next `!w`, `!wd`, or `!wme`. Reminders use saved public titles; when repositories are connected,
-they refresh metadata with a new access check. Connected metadata is never persisted or reused after
-an authorization failure. If GitHub is unavailable or rate-limited, the queue still works, using
-cached public details or just the link for connected repositories.
-Each metadata batch has an eight-second deadline with at most four requests at a time. Replies use
-the details that arrived before the deadline; unfinished lookups can be retried on the next command.
-Different chats process commands independently, while each chat keeps its command order. Up to
-eight chats run at once and four commands can wait or run per chat; excess commands receive a
-coalesced busy notice and must be resent. Oversized entries are split without dropping assignees
-or breaking links and formatting.
-Failed lookups are also cached for five minutes to avoid repeated requests. Metadata is stored by
-chat and URL: one group's cached details are never read by another group. When upgrading from the
-earlier shared-cache implementation, its metadata cache is discarded because its records have no
-trustworthy team ownership. Queues, assignments, and review history are preserved.
 
 It also lists the PRs/MRs you added that a reviewer finished, with who finished them and when (Asia/Tashkent date):
 
@@ -445,8 +319,8 @@ It also lists the PRs/MRs you added that a reviewer finished, with who finished 
 
 Only each PR/MR's latest outcome counts: re-adding one takes it off the list, and bouncing an approved one moves it to "need changes". Approvals and bounces older than 14 days are hidden, since by then the PR/MR was probably merged, closed, or replaced. They're matched to you by your Telegram account, so they appear even without a username. Approvals from before `!wmerged` existed are treated as already merged.
 
-- In groups the reply is a Telegram [ephemeral message](https://core.telegram.org/bots/api#ephemeral-messages-and-commands) (this implementation uses Bot API 10.3+ parameters): only you and the bot see it. Telegram may drop it if you are offline or after an app restart, so just send `!wme` again.
-- The bot must be a group **admin** to send ephemeral messages. Otherwise it replies with a short notice instead of posting your list publicly. `!wd`, `!wme`, and GitHub onboarding send only a neutral placeholder until private delivery is verified, then use an ephemeral-only edit to add details. If an older server posts that placeholder publicly, the bot tries to delete it and sends no details.
+- In groups the reply is a Telegram [ephemeral message](https://core.telegram.org/bots/api#ephemeral-messages-and-commands) (Bot API 10.2+): only you and the bot see it. Telegram may drop it if you are offline or after an app restart, so just send `!wme` again.
+- The bot must be a group **admin** to send ephemeral messages. Otherwise it replies with a short notice instead of posting your list publicly. If Telegram ever posts the reply publicly (for example, a self-hosted Bot API server without ephemeral support), the bot deletes it immediately.
 - `!wclear` clears before it replies, so if the private reply fails, the public notice still says how many PRs/MRs were cleared (without naming them). Sending `!wclear` again won't show them.
 - Your `!wme` or `!wclear` message itself stays visible to the group; only the reply is private. Usage and invalid-reference errors from `!wclear` are still public, since they don't list your PRs/MRs. When `!wmerged` matches several of your approved PRs/MRs, that list is private too.
 - In a direct message with the bot, `!wme` lists your reviews from all groups you're still a member of, as a normal reply, under each group's name. If Telegram can't confirm your membership in a group right now (for example, a timeout), the reply says so and you can send `!wme` again.

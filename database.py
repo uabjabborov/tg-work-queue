@@ -1,6 +1,5 @@
 import os
 import sqlite3
-import secrets
 from typing import Optional
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -31,8 +30,6 @@ class Task:
     created_by: str
     created_at: datetime
     created_by_id: Optional[int] = None
-    title: Optional[str] = None
-    description: Optional[str] = None
 
 
 @dataclass
@@ -57,8 +54,6 @@ class FinishedReview:
     outcome: str
     completed_by: str
     completed_at: datetime
-    title: Optional[str] = None
-    description: Optional[str] = None
 
 
 @dataclass
@@ -92,34 +87,6 @@ class Database:
 
     def _init_db(self, now: Optional[datetime] = None) -> None:
         with self._get_connection() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS github_connections (
-                    chat_id INTEGER NOT NULL,
-                    repository TEXT NOT NULL,
-                    repository_id INTEGER NOT NULL,
-                    installation_id INTEGER NOT NULL,
-                    connected_by INTEGER NOT NULL,
-                    github_user_id INTEGER NOT NULL,
-                    connection_id TEXT NOT NULL,
-                    connected_at TEXT NOT NULL,
-                    PRIMARY KEY (chat_id, repository)
-                )
-            """)
-            metadata_columns = {row["name"] for row in conn.execute("PRAGMA table_info(review_metadata)")}
-            if metadata_columns and "chat_id" not in metadata_columns:
-                # The earlier shared cache has no trustworthy team ownership and may contain
-                # private details fetched with global credentials. Re-fetch instead of copying it.
-                conn.execute("DROP TABLE review_metadata")
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS review_metadata (
-                    chat_id INTEGER NOT NULL,
-                    url TEXT NOT NULL,
-                    title TEXT,
-                    description TEXT,
-                    checked_at TEXT NOT NULL,
-                    PRIMARY KEY (chat_id, url)
-                )
-            """)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS tasks (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -448,8 +415,7 @@ class Database:
             }
             return [
                 FinishedReview(row["id"], row["chat_id"], row["task_id"], row["url"], row["outcome"],
-                               row["completed_by"], datetime.fromisoformat(row["completed_at"]),
-                               **self._metadata_fields(conn, row["chat_id"], row["url"]))
+                               row["completed_by"], datetime.fromisoformat(row["completed_at"]))
                 for row in rows
                 if (row["chat_id"], (row["review_host"], row["review_project"], row["review_number"])) not in queued
             ]
@@ -471,60 +437,6 @@ class Database:
                 VALUES (?, ?, ?, ?)
             """, [(activity_id, cleared_by, cleared_by_id, timestamp) for activity_id in activity_ids])
 
-    def get_github_connection(self, chat_id: int, repository: str) -> Optional[dict]:
-        with self._get_connection() as conn:
-            row = conn.execute("SELECT * FROM github_connections WHERE chat_id = ? AND repository = ?",
-                               (chat_id, repository.lower())).fetchone()
-            return dict(row) if row else None
-
-    def get_github_connections(self, chat_id: int) -> list[dict]:
-        with self._get_connection() as conn:
-            return [dict(row) for row in conn.execute(
-                "SELECT * FROM github_connections WHERE chat_id = ? ORDER BY repository", (chat_id,))]
-
-    def connect_github(self, chat_id: int, repository: str, repository_id: int, installation_id: int,
-                       connected_by: int, github_user_id: int) -> None:
-        with self._get_connection() as conn:
-            conn.execute("""
-                INSERT OR REPLACE INTO github_connections
-                    (chat_id, repository, repository_id, installation_id, connected_by, github_user_id,
-                     connection_id, connected_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (chat_id, repository.lower(), repository_id, installation_id, connected_by, github_user_id,
-                  secrets.token_hex(16), utc_timestamp()))
-            conn.execute("DELETE FROM review_metadata WHERE chat_id = ?", (chat_id,))
-
-    def disconnect_github(self, chat_id: int, repository: str) -> bool:
-        with self._get_connection() as conn:
-            deleted = conn.execute("DELETE FROM github_connections WHERE chat_id = ? AND repository = ?",
-                                   (chat_id, repository.lower())).rowcount
-            conn.execute("DELETE FROM review_metadata WHERE chat_id = ?", (chat_id,))
-            return bool(deleted)
-
-    def get_review_metadata(self, chat_id: int, url: str) -> Optional[dict]:
-        with self._get_connection() as conn:
-            row = conn.execute("SELECT * FROM review_metadata WHERE chat_id = ? AND url = ?",
-                               (chat_id, url)).fetchone()
-            return dict(row) if row else None
-
-    def save_review_metadata(self, chat_id: int, url: str, title: Optional[str], description: Optional[str],
-                             now: Optional[datetime] = None) -> None:
-        """Cache successful lookups; a failed lookup keeps the last known details."""
-        with self._get_connection() as conn:
-            conn.execute("""
-                INSERT INTO review_metadata (chat_id, url, title, description, checked_at) VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(chat_id, url) DO UPDATE SET
-                    title = COALESCE(excluded.title, review_metadata.title),
-                    description = COALESCE(excluded.description, review_metadata.description),
-                    checked_at = excluded.checked_at
-            """, (chat_id, url, title, description, utc_timestamp(now)))
-
-    @staticmethod
-    def _metadata_fields(conn: sqlite3.Connection, chat_id: int, url: str) -> dict:
-        row = conn.execute("SELECT title, description FROM review_metadata WHERE chat_id = ? AND url = ?",
-                           (chat_id, url)).fetchone()
-        return dict(row) if row else {}
-
     def _row_to_task(self, conn: sqlite3.Connection, row: sqlite3.Row) -> Task:
         assignees = self._get_task_assignees(conn, row["id"])
         return Task(
@@ -536,8 +448,7 @@ class Database:
             assignees=assignees,
             created_by=row["created_by"],
             created_at=row["created_at"],
-            created_by_id=row["created_by_id"],
-            **self._metadata_fields(conn, row["chat_id"], row["url"])
+            created_by_id=row["created_by_id"]
         )
 
     def remove_task_by_id(self, chat_id: int, task_id: str) -> Optional[Task]:

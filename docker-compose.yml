@@ -7,6 +7,5 @@ services:
       - DATA_DIR=/app/data
     volumes:
       - ./data:/app/data
-      - ./secrets:/app/secrets:ro
     env_file:
       - .env
