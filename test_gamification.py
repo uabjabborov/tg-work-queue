@@ -14,7 +14,9 @@ import httpx2
 from telegram.error import BadRequest
 
 from database import Database, utc_timestamp
-from cheer_lines import BODIES, CLOSERS, COMBOS, EMPTY_QUEUE, OPENERS, SLOTS, TIER_OPENERS
+from cheer_lines import (
+    BODIES, CALL_TO_ACTION, CLOSERS, COMBOS, EMPTY_QUEUE, NOTHING_TO_REVIEW, OPENERS, SLOTS, TIER_OPENERS,
+)
 from gamification import (
     EMPTY_QUEUE_COOLDOWN, TIER_EMOJI, Cheer, CheerWriter, approval_cheer, bounce_cheer, empty_queue_quip, format_wait,
     header, queue_wait, speed_tier, template_quip,
@@ -86,7 +88,8 @@ class LineLibraryTests(unittest.TestCase):
 
     def all_pools(self):
         for name, group in (("openers", OPENERS), ("bodies", BODIES), ("combos", COMBOS), ("closers", CLOSERS),
-                            ("empty", {"queue": EMPTY_QUEUE})):
+                            ("empty", {"queue": EMPTY_QUEUE}), ("nothing", {"to_review": NOTHING_TO_REVIEW}),
+                            ("cta", {"add": CALL_TO_ACTION})):
             for key, pool in group.items():
                 for language, lines in pool.items():
                     yield f"{name}/{key}/{language}", language, lines
@@ -130,13 +133,20 @@ class LineLibraryTests(unittest.TestCase):
             with self.subTest(where=where):
                 self.assertEqual(len(lines), len(set(lines)))
 
-    def test_empty_queue_lines_suit_both_uses(self):
-        for language, lines in EMPTY_QUEUE.items():
-            with self.subTest(language=language):
-                self.assertGreaterEqual(len(lines), 10)
-                for line in lines:
-                    # No review facts: the same lines serve the celebration and !w.
-                    self.assertNotRegex(line, r"\{(time|count|round)\}")
+    def test_public_lines_have_plenty_per_language_and_no_review_facts(self):
+        for name, pool in (("empty", EMPTY_QUEUE), ("nothing", NOTHING_TO_REVIEW), ("cta", CALL_TO_ACTION)):
+            self.assertEqual(set(pool), {"en", "uz", "ru"})
+            for language, lines in pool.items():
+                with self.subTest(pool=name, language=language):
+                    self.assertGreaterEqual(len(lines), 10)
+                    for line in lines:
+                        # Public lines don't describe a particular review.
+                        self.assertNotRegex(line, r"\{(time|count|round)\}")
+
+    def test_calls_to_action_lead_into_the_add_command(self):
+        for line in (line for lines in CALL_TO_ACTION.values() for line in lines):
+            with self.subTest(line=line):
+                self.assertTrue(line.endswith(":"))
 
     def test_empty_queue_quips_fill_slots_and_rotate(self):
         rng, recent, quips, lines = random.Random(6), deque(maxlen=12), [], []
@@ -434,6 +444,7 @@ class BotCheerTests(unittest.IsolatedAsyncioTestCase):
         update, _ = await self.command("!wdone 56")
         reply = update.message.reply_text.await_args.args[0]
         self.assertIn("\n\n🎉 <b>Queue is empty!</b> @alice closed the last one.\n", reply)
+        self.assertTrue(reply.endswith("<code>!wadd &lt;PR/MR link&gt;</code>"))
         self.assertTrue(reply.startswith("Removed"))
         self.assertEqual(update.message.reply_text.await_count, 1)
 
@@ -453,14 +464,35 @@ class BotCheerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("🎉 <b>Queue is empty!</b>\n", update.message.reply_text.await_args.args[0])
 
-    async def test_w_on_an_empty_queue_adds_a_fun_line(self):
+    async def test_w_on_an_empty_queue_adds_a_fun_line_and_a_call_to_action(self):
         update, _ = await self.command("!w")
 
         text = update.message.reply_text.await_args.args[0]
-        first, second = text.split("\n")
+        first, second, third = text.split("\n")
         self.assertEqual(first, "📭 No tasks in the queue.")
         self.assertTrue(second)
+        self.assertTrue(third.startswith("👉 ") and third.endswith(": <code>!wadd &lt;PR/MR link&gt;</code>"))
         self.assertEqual(update.message.reply_text.await_args.kwargs["parse_mode"], "HTML")
+
+    async def test_finishing_reviews_on_an_empty_queue_gets_a_public_nudge(self):
+        for command, action in (("!wdone 55", "mark done"), ("!wbounce 1-3", "send back"),
+                                ("!wdone https://github.com/owner/repo/pull/9", "mark done")):
+            with self.subTest(command=command):
+                update, telegram_bot = await self.command(command)
+
+                update.message.reply_text.assert_awaited_once()
+                lines = update.message.reply_text.await_args.args[0].split("\n")
+                self.assertEqual(lines[0], f"📭 The queue is empty, so there's nothing to {action}.")
+                self.assertEqual(len(lines), 3)
+                self.assertNotRegex(lines[1], r"\{\w+\}")
+                self.assertTrue(lines[2].endswith("<code>!wadd &lt;PR/MR link&gt;</code>"))
+                telegram_bot.send_message.assert_not_awaited()
+
+    async def test_usage_and_invalid_references_still_explain_on_an_empty_queue(self):
+        update, _ = await self.command("!wdone")
+        self.assertTrue(update.message.reply_text.await_args.args[0].startswith("Usage:"))
+        update, _ = await self.command("!wdone #1")
+        self.assertIn("no longer supported", update.message.reply_text.await_args.args[0])
 
     async def test_a_failing_celebration_never_breaks_the_removal(self):
         self.add_task(55)

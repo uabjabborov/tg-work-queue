@@ -379,16 +379,30 @@ The first line states the facts: the review, and for `!wdone` how long it waited
 
 ### Empty queue
 
-When `!wdone` or `!wbounce` removes the last review, the public reply also celebrates, for everyone to see:
+Every public message about an empty queue has a funny line and ends with a call to action, such as "👉 Got a PR waiting? Feed the queue: `!wadd <PR/MR link>`". There are three of them:
 
-```
-Removed repo/55 (added by @bob)
+- **The last review leaves the queue** (`!wdone` or `!wbounce`): the reply celebrates who closed it.
 
-🎉 Queue is empty! @alice closed the last one.
-Reviewers 1, queue 0. ⚽
-```
+  ```
+  Removed repo/55 (added by @bob)
 
-To keep quiet chats from getting one after every review, a chat is congratulated at most once an hour (tracked in memory until restart). `!w` on an empty queue also adds a fun line under "📭 No tasks in the queue." Both use only the free library in `cheer_lines.py` (`EMPTY_QUEUE`), never Claude.
+  🎉 Queue is empty! @alice closed the last one.
+  Reviewers 1, queue 0. ⚽
+  👉 Следующий PR, прошу: !wadd <PR/MR link>
+  ```
+
+  To keep quiet chats from getting one after every review, a chat is congratulated at most once an hour (tracked in memory until restart).
+- **`!wdone` or `!wbounce` when the queue is already empty**: instead of "not found", the bot says there's nothing to mark done (or send back) and nudges the chat to add PRs. Usage and invalid-reference errors are still shown as before.
+
+  ```
+  📭 The queue is empty, so there's nothing to mark done.
+  404: ревью не найдено 🔍
+  👉 Birinchi bo'lib navbatga turing: !wadd <PR/MR link>
+  ```
+
+- **`!w` on an empty queue**: "📭 No tasks in the queue." plus a funny line and a call to action.
+
+These lines come only from the free library in `cheer_lines.py` (`EMPTY_QUEUE`, `NOTHING_TO_REVIEW`, `CALL_TO_ACTION`), never Claude, and a chat doesn't get the same line again within its last 12.
 
 ## Notes
 

@@ -128,6 +128,8 @@ class QueueReferenceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_references_are_restricted_to_current_chat(self):
         self.add_task(chat_id=2)
+        # Chat 1 isn't empty, so the references get "not found" rather than the empty-queue nudge.
+        self.add_task(chat_id=1, task_id="other/1")
         references = ("repo/120", "120", "https://github.com/owner/repo/pull/120")
 
         for command in ("wdone", "wbounce", "wassign"):

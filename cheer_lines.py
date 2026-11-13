@@ -495,6 +495,93 @@ EMPTY_QUEUE = {
     ],
 }
 
+# Public lines for !wdone or !wbounce when the queue is already empty, so there's nothing to finish.
+NOTHING_TO_REVIEW = {
+    "en": [
+        "Ambition: 100. Reviews in the queue: 0. 😄",
+        "You tried to finish a review that doesn't exist. Overachiever! 🏅",
+        "The queue is emptier than the office fridge on a Friday. 🧊",
+        "Nothing here but tumbleweeds. 🌵",
+        "404: review not found. 🔍",
+        "Even {hero_en} can't review a PR that isn't there.",
+        "Zero PRs. The reviewers are getting restless. 😴",
+        "The queue is on vacation. 🏖️",
+        "So fast you reviewed the PR before anyone added it. ⚡",
+        "Reviewing the void? The void approves. 🕳️",
+        "All dressed up and nothing to review. 🎩",
+        "Eager reviewer detected. PRs not found. 🤖",
+    ],
+    "uz": [
+        "Ishtiyoq: 100. Navbatdagi review: 0 😄",
+        "Mavjud bo'lmagan reviewni tugatmoqchisiz. Juda tirishqoq ekansiz! 🏅",
+        "Navbat juma kungi ofis muzlatkichidan ham bo'shroq 🧊",
+        "Bu yerda faqat shamol esyapti 🌵",
+        "404: review topilmadi 🔍",
+        "Hatto {hero_uz} ham yo'q PRni review qilolmaydi.",
+        "Reviewerlar zerikib qolishdi 😴",
+        "Navbat ta'tilga chiqib ketdi 🏖️",
+        "Shunchalik tezsizki, PR qo'shilmasdan oldin review qildingiz ⚡",
+        "Bo'shliqni review qilyapsizmi? Bo'shliq rozi 🕳️",
+        "Kiyinib-yasanib keldingiz, review esa yo'q 🎩",
+        "Tirishqoq reviewer topildi, PR topilmadi 🤖",
+    ],
+    "ru": [
+        "Амбиции: 100. Ревью в очереди: 0 😄",
+        "Пытаешься закрыть ревью, которого нет. Перевыполнение плана! 🏅",
+        "Очередь пустее, чем офисный холодильник в пятницу 🧊",
+        "Тут только перекати-поле 🌵",
+        "404: ревью не найдено 🔍",
+        "Даже {hero_ru} не отревьюит PR, которого нет.",
+        "Ревьюеры скучают 😴",
+        "Очередь ушла в отпуск 🏖️",
+        "Так быстро, что отревьюил PR ещё до того, как его добавили ⚡",
+        "Ревьюишь пустоту? Пустота одобряет 🕳️",
+        "Принарядился, а ревьюить нечего 🎩",
+        "Обнаружен рвущийся в бой ревьюер. PR не обнаружены 🤖",
+    ],
+}
+
+# Calls to action closing every public empty-queue message. The bot appends "!wadd <PR/MR link>" in
+# code formatting, so each line ends with a colon.
+CALL_TO_ACTION = {
+    "en": [
+        "Got a PR waiting? Feed the queue:",
+        "The reviewers are hungry. Serve them a PR:",
+        "Don't let the reviewers get bored. Add a PR:",
+        "Your PR deserves an audience:",
+        "Finished something? Send it in:",
+        "The queue is open for business:",
+        "Next PR, step right up:",
+        "Be the first PR in line:",
+        "Strike while the reviewers are free:",
+        "Code written? Review time:",
+    ],
+    "uz": [
+        "PR tayyormi? Navbatga qo'shing:",
+        "Reviewerlar och qolishdi. Ularga PR bering:",
+        "Reviewerlar zerikib qolmasin. PR qo'shing:",
+        "PRingiz tomoshabin kutyapti:",
+        "Biror narsani tugatdingizmi? Yuboring:",
+        "Navbat ochiq, marhamat:",
+        "Navbatdagi PR, marhamat, kiring:",
+        "Birinchi bo'lib navbatga turing:",
+        "Reviewerlar bo'shligida fursatni boy bermang:",
+        "Kod yozildimi? Endi review vaqti:",
+    ],
+    "ru": [
+        "Есть PR? Кидай в очередь:",
+        "Ревьюеры голодны. Подай им PR:",
+        "Не дай ревьюерам заскучать. Добавь PR:",
+        "Твой PR заслуживает зрителей:",
+        "Что-то доделал? Отправляй:",
+        "Очередь открыта, заходите:",
+        "Следующий PR, прошу:",
+        "Будь первым в очереди:",
+        "Куй железо, пока ревьюеры свободны:",
+        "Код написан? Время ревью:",
+    ],
+}
+
 # Fill-ins for {<slot>_<language>} placeholders.
 SLOTS = {
     "fast_en": ["a cheetah on espresso", "a cat hearing the fridge open", "gossip in the office kitchen",

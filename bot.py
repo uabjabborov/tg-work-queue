@@ -492,8 +492,7 @@ async def handle_w(update: Update, chat_id: int) -> None:
     tasks = db.get_tasks(chat_id)
     
     if not tasks:
-        await update.message.reply_text(f"📭 No tasks in the queue.\n{cheer_writer.empty_queue_line(chat_id)}",
-                                        parse_mode=ParseMode.HTML)
+        await update.message.reply_text(cheer_writer.empty_queue_listing(chat_id), parse_mode=ParseMode.HTML)
         return
     
     response = "\n".join(task_listing(task) for task in tasks)
@@ -767,6 +766,10 @@ async def handle_remove_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE
     references = split_references(args)
     if not references:
         await update.message.reply_text(usage, parse_mode=ParseMode.HTML)
+        return
+    # Valid references on an empty queue get a funny nudge to add PRs instead of "not found".
+    if invalid_reference_error(references, "") is None and not db.get_tasks(chat_id):
+        await update.message.reply_text(cheer_writer.nothing_to_review(chat_id, outcome), parse_mode=ParseMode.HTML)
         return
     resolutions = await resolve_queue_references(update, chat_id, [references])
     if resolutions is None:
