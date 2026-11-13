@@ -492,7 +492,8 @@ async def handle_w(update: Update, chat_id: int) -> None:
     tasks = db.get_tasks(chat_id)
     
     if not tasks:
-        await update.message.reply_text("No tasks in the queue.")
+        await update.message.reply_text(f"📭 No tasks in the queue.\n{cheer_writer.empty_queue_line(chat_id)}",
+                                        parse_mode=ParseMode.HTML)
         return
     
     response = "\n".join(task_listing(task) for task in tasks)
@@ -793,10 +794,24 @@ async def handle_remove_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE
     if removed and comment:
         blocks.append(html_escape(comment))
     blocks += queue_problem_blocks(resolution, [task for task in tasks if task.id not in removed_ids])
+    if removed and (celebration := empty_queue_celebration(chat_id, completed_by_id, completed_by)):
+        blocks.append(f"\n{celebration}")
     await reply_blocks(update, blocks)
     logger.info(f"Removed {len(removed)} tasks ({outcome}) from chat {chat_id}")
     if removed:
         schedule_cheer(update, context, chat_id, removed, outcome)
+
+
+def empty_queue_celebration(chat_id: int, closer_id: int | None, closer: str) -> str | None:
+    """A public note when the queue has just become empty; a failure here never affects the removal."""
+    try:
+        if db.get_tasks(chat_id):
+            return None
+        return cheer_writer.empty_queue_celebration(chat_id, closer if closer_id is not None else None,
+                                                    datetime.now(timezone.utc))
+    except Exception:
+        logger.exception("Could not celebrate the empty queue in chat %s", chat_id)
+        return None
 
 
 def schedule_cheer(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, removed: list[Task],

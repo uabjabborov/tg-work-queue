@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from html import escape as html_escape
 from typing import Optional
 
-from cheer_lines import BODIES, CLOSERS, COMBOS, OPENERS, SLOTS, TIER_OPENERS
+from cheer_lines import BODIES, CLOSERS, COMBOS, EMPTY_QUEUE, OPENERS, SLOTS, TIER_OPENERS
 from presentation import review_link
 
 logger = logging.getLogger(__name__)
@@ -37,6 +37,9 @@ COMBO_SIZE = 3
 # Quips a person saw recently are avoided, so the same line doesn't come back soon.
 RECENT_PER_PERSON = 12
 MAX_QUIP_LENGTH = 300
+# The public "queue is empty" celebration is posted at most this often per chat, so a quiet chat where
+# every !wdone empties the queue doesn't get one each time.
+EMPTY_QUEUE_COOLDOWN = timedelta(hours=1)
 # Optional Claude-written quips: the smallest current model is plenty for one line, and keeps the cost
 # per cheer tiny. CHEERS_MODEL picks another model. max_tokens caps spend, with room for brief thinking.
 DEFAULT_MODEL = "claude-haiku-5-5"
@@ -164,6 +167,19 @@ def template_quip(cheer: Cheer, rng: random.Random, recent: Optional[deque] = No
     return " ".join(fill(part, cheer, rng) for part in parts)
 
 
+def empty_queue_quip(rng: random.Random, recent: Optional[deque] = None) -> str:
+    """A public line for an empty queue, sometimes with an opener, in any of the languages."""
+    recent = recent if recent is not None else deque()
+    lines = [line for language in EMPTY_QUEUE.values() for line in language]
+    line = rng.choice([line for line in lines if line not in recent] or lines)
+    recent.append(line)
+    parts = [line]
+    if rng.random() < 0.5:
+        parts.insert(0, rng.choice([opener for language in OPENERS["hype"].values() for opener in language]))
+    slots = {name: rng.choice(options) for name, options in SLOTS.items()}
+    return " ".join(part.format(**slots) for part in parts)
+
+
 AI_SYSTEM_PROMPT = """You write one short, playful private message to a software engineer in a team's Telegram chat, \
 right after they finished a code review. Only they will see it.
 
@@ -222,6 +238,9 @@ class CheerWriter:
         self.recent_lines: dict[object, deque] = {}
         # The quips each person actually saw, so Claude avoids repeating them.
         self.recent_quips: dict[object, deque] = {}
+        # Empty-queue lines each chat saw recently, and when each chat was last congratulated.
+        self.recent_empty_lines: dict[int, deque] = {}
+        self.last_empty_celebration: dict[int, datetime] = {}
 
     @classmethod
     def from_environment(cls) -> "CheerWriter":
@@ -274,6 +293,22 @@ class CheerWriter:
         if not text or len(text) > MAX_QUIP_LENGTH:
             return None
         return text
+
+    def empty_queue_line(self, chat_id: int) -> str:
+        """A fun line for an empty queue, in HTML. Always from the free library: it's posted publicly."""
+        recent = self.recent_empty_lines.setdefault(chat_id, deque(maxlen=RECENT_PER_PERSON))
+        return html_escape(empty_queue_quip(self.rng, recent), quote=False)
+
+    def empty_queue_celebration(self, chat_id: int, closer: Optional[str], now: datetime) -> Optional[str]:
+        """The public note after the last review leaves the queue, or None if this chat had one recently."""
+        last = self.last_empty_celebration.get(chat_id)
+        if last is not None and now - last < EMPTY_QUEUE_COOLDOWN:
+            return None
+        self.last_empty_celebration[chat_id] = now
+        headline = "🎉 <b>Queue is empty!</b>"
+        if closer:
+            headline += f" {html_escape(closer)} closed the last one."
+        return f"{headline}\n{self.empty_queue_line(chat_id)}"
 
     async def message(self, cheer: Cheer, person) -> str:
         return f"{header(cheer)}\n{await self.quip(cheer, person)}"

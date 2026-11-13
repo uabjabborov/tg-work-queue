@@ -448,6 +448,53 @@ CLOSERS = {
     },
 }
 
+# Public lines for an empty queue: after the last review leaves it, and for !w. They must read well in
+# both cases, so they describe the empty queue rather than who emptied it. Only slots, no {time}/{count}/{round}.
+EMPTY_QUEUE = {
+    "en": [
+        "Inbox zero, but for code reviews. 🏖️",
+        "Nothing to review. Somebody check the PR factory is still running. 🏭",
+        "Zero PRs waiting. This is what peak performance looks like. 🏔️",
+        "All caught up! Time for {treat_en}. ☕",
+        "Queue status: spotless. ✨",
+        "Not a single PR in sight. Suspiciously peaceful... 👀",
+        "Reviewers 1, queue 0. ⚽",
+        "Achievement unlocked: Empty Queue. 🏆",
+        "Somewhere, a developer is writing the next PR. Enjoy the calm. 🌅",
+        "The queue is empty. Go touch some grass. 🌱",
+        "Every PR got its review. Group hug! 🤗",
+        "Empty queue, happy team. 😊",
+    ],
+    "uz": [
+        "Navbat bo'm-bo'sh! Choy vaqti ☕",
+        "Birorta ham PR kutmayapti. Mana bu jamoa! 💪",
+        "Hamma ish joyida. Endi {treat_uz} bilan dam olsa bo'ladi.",
+        "Navbat top-toza ✨",
+        "Review navbati: nol. Rekord darajadagi tartib! 🏆",
+        "Hammaning PRi ko'rib chiqildi. Barakalla, jamoa! 🤗",
+        "Juda tinch... hatto shubhali darajada 👀",
+        "Reviewerlar 1, navbat 0 ⚽",
+        "Bo'sh navbat — baxtli jamoa 😊",
+        "Kimdir hozir keyingi PRni yozyapti. Shu orada dam oling 🌅",
+        "Navbat bo'sh, ko'ngil to'q 🌿",
+        "Yutuq ochildi: Bo'sh navbat 🏆",
+    ],
+    "ru": [
+        "Очередь пуста! Можно выдохнуть 🧘",
+        "Ни одного PR в очереди. Подозрительно спокойно... 👀",
+        "Inbox zero, только для ревью 🏖️",
+        "Ревьюеры 1, очередь 0 ⚽",
+        "Ачивка разблокирована: Пустая очередь 🏆",
+        "Всё проверено. Команда, вы великолепны! 🤗",
+        "Очередь чиста, как слеза ✨",
+        "Где-то уже пишется следующий PR. Наслаждайтесь тишиной 🌅",
+        "Пустая очередь — счастливая команда 😊",
+        "Можно смело идти пить чай ☕",
+        "Работа сделана. Можно и потрогать траву 🌱",
+        "Все PR на месте... то есть нигде. Идеально! 🎯",
+    ],
+}
+
 # Fill-ins for {<slot>_<language>} placeholders.
 SLOTS = {
     "fast_en": ["a cheetah on espresso", "a cat hearing the fridge open", "gossip in the office kitchen",

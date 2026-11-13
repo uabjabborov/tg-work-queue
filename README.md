@@ -328,7 +328,7 @@ Reminders use 5-part cron expressions in UTC timezone:
 - **Private Assignment View**: `!wme` replies with an ephemeral message only the sender can see, including your PRs/MRs that are ready to merge or need changes
 - **Custom Reminders**: Each channel can configure its own reminder schedule
 - **Weekly Leaderboards**: Separate contributor and reviewer rankings and Monday recaps for each chat
-- **Reviewer Cheers**: After `!wdone` or `!wbounce`, the reviewer privately gets a playful message about their speed or bounce round
+- **Reviewer Cheers**: After `!wdone` or `!wbounce`, the reviewer privately gets a playful message about their speed or bounce round, and the chat celebrates when the queue becomes empty
 - **Persistent Storage**: Data is stored in SQLite database (`workqueue.db`)
 - **Flexible Assignment**: Reassign tasks at any time, replacing all existing assignees
 
@@ -376,6 +376,19 @@ The first line states the facts: the review, and for `!wdone` how long it waited
 - Reviewing your own PR/MR earns no cheer, using the same rules as the leaderboard (including entries saved under an old username). Anonymous admins get none either. Bounce rounds only count reviewers sending the PR/MR back, not its author bouncing it themselves.
 - Cheers are sent in the background after the public "Removed …" reply, so a slow Claude response never holds up the bot. If the private message can't be delivered (for example, the bot isn't a group admin), the cheer is dropped and only logged. The bot posts no notice in the chat. If the Bot API server posts a private message publicly (for example, a self-hosted server without ephemeral support), the bot deletes it and stops sending cheers until it restarts, so later commands don't flash public messages. If it can't delete that message, it asks the chat to.
 - Queue time is wall-clock time, so a PR/MR added on Friday evening and reviewed on Monday counts as slow. Slow reviews are teased gently, never shamed.
+
+### Empty queue
+
+When `!wdone` or `!wbounce` removes the last review, the public reply also celebrates, for everyone to see:
+
+```
+Removed repo/55 (added by @bob)
+
+🎉 Queue is empty! @alice closed the last one.
+Reviewers 1, queue 0. ⚽
+```
+
+To keep quiet chats from getting one after every review, a chat is congratulated at most once an hour (tracked in memory until restart). `!w` on an empty queue also adds a fun line under "📭 No tasks in the queue." Both use only the free library in `cheer_lines.py` (`EMPTY_QUEUE`), never Claude.
 
 ## Notes
 

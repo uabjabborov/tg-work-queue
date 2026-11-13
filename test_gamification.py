@@ -14,10 +14,10 @@ import httpx2
 from telegram.error import BadRequest
 
 from database import Database, utc_timestamp
-from cheer_lines import BODIES, CLOSERS, COMBOS, OPENERS, SLOTS, TIER_OPENERS
+from cheer_lines import BODIES, CLOSERS, COMBOS, EMPTY_QUEUE, OPENERS, SLOTS, TIER_OPENERS
 from gamification import (
-    TIER_EMOJI, Cheer, CheerWriter, approval_cheer, bounce_cheer, format_wait, header, queue_wait, speed_tier,
-    template_quip,
+    EMPTY_QUEUE_COOLDOWN, TIER_EMOJI, Cheer, CheerWriter, approval_cheer, bounce_cheer, empty_queue_quip, format_wait,
+    header, queue_wait, speed_tier, template_quip,
 )
 
 with patch.object(Database, "_init_db"):
@@ -85,7 +85,8 @@ class LineLibraryTests(unittest.TestCase):
     """Checks every line in cheer_lines.py, so a typo in a new line fails here and not in a chat."""
 
     def all_pools(self):
-        for name, group in (("openers", OPENERS), ("bodies", BODIES), ("combos", COMBOS), ("closers", CLOSERS)):
+        for name, group in (("openers", OPENERS), ("bodies", BODIES), ("combos", COMBOS), ("closers", CLOSERS),
+                            ("empty", {"queue": EMPTY_QUEUE})):
             for key, pool in group.items():
                 for language, lines in pool.items():
                     yield f"{name}/{key}/{language}", language, lines
@@ -128,6 +129,24 @@ class LineLibraryTests(unittest.TestCase):
         for where, _, lines in self.all_pools():
             with self.subTest(where=where):
                 self.assertEqual(len(lines), len(set(lines)))
+
+    def test_empty_queue_lines_suit_both_uses(self):
+        for language, lines in EMPTY_QUEUE.items():
+            with self.subTest(language=language):
+                self.assertGreaterEqual(len(lines), 10)
+                for line in lines:
+                    # No review facts: the same lines serve the celebration and !w.
+                    self.assertNotRegex(line, r"\{(time|count|round)\}")
+
+    def test_empty_queue_quips_fill_slots_and_rotate(self):
+        rng, recent, quips, lines = random.Random(6), deque(maxlen=12), [], []
+        for _ in range(30):
+            quips.append(empty_queue_quip(rng, recent))
+            lines.append(recent[-1])
+        self.assertFalse(any(PLACEHOLDER.search(quip) for quip in quips))
+        for start in range(len(lines) - 12):
+            self.assertEqual(len(set(lines[start:start + 12])), 12)
+        self.assertGreater(len(set(quips)), 25)
 
     def test_one_tier_already_yields_thousands_of_different_messages(self):
         rng = random.Random(4)
@@ -277,9 +296,10 @@ class BotCheerTests(unittest.IsolatedAsyncioTestCase):
         self.db.add_task(1, f"repo/{number}", f"https://github.com/owner/repo/pull/{number}", [], author, author_id,
                          now=datetime.now(timezone.utc) - timedelta(minutes=queued_minutes_ago))
 
-    async def command(self, text, user_id=7, username="alice", send_message=None, delete_message=None):
+    async def command(self, text, user_id=7, username="alice", send_message=None, delete_message=None,
+                      anonymous=False):
         update = SimpleNamespace(
-            message=SimpleNamespace(text=text, reply_text=AsyncMock(), sender_chat=None,
+            message=SimpleNamespace(text=text, reply_text=AsyncMock(), sender_chat=object() if anonymous else None,
                                     is_topic_message=False, message_thread_id=None),
             effective_chat=SimpleNamespace(id=1, type="supergroup"),
             effective_user=SimpleNamespace(id=user_id, username=username, first_name="Alice", is_bot=False),
@@ -403,6 +423,53 @@ class BotCheerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(update.message.reply_text.await_count, 2)
         self.assertIn("please delete it", update.message.reply_text.await_args.args[0])
+
+    async def test_emptying_the_queue_celebrates_publicly_at_most_hourly(self):
+        self.add_task(55)
+        self.add_task(56)
+
+        update, _ = await self.command("!wdone 55")
+        self.assertNotIn("Queue is empty", update.message.reply_text.await_args.args[0])
+
+        update, _ = await self.command("!wdone 56")
+        reply = update.message.reply_text.await_args.args[0]
+        self.assertIn("\n\n🎉 <b>Queue is empty!</b> @alice closed the last one.\n", reply)
+        self.assertTrue(reply.startswith("Removed"))
+        self.assertEqual(update.message.reply_text.await_count, 1)
+
+        self.add_task(57)
+        update, _ = await self.command("!wbounce 57")
+        self.assertNotIn("Queue is empty", update.message.reply_text.await_args.args[0])
+
+        bot.cheer_writer.last_empty_celebration[1] -= EMPTY_QUEUE_COOLDOWN
+        self.add_task(58)
+        update, _ = await self.command("!wdone 58")
+        self.assertIn("🎉 <b>Queue is empty!</b>", update.message.reply_text.await_args.args[0])
+
+    async def test_anonymous_closer_gets_no_name_in_the_celebration(self):
+        self.add_task(55)
+
+        update, _ = await self.command("!wdone 55", anonymous=True)
+
+        self.assertIn("🎉 <b>Queue is empty!</b>\n", update.message.reply_text.await_args.args[0])
+
+    async def test_w_on_an_empty_queue_adds_a_fun_line(self):
+        update, _ = await self.command("!w")
+
+        text = update.message.reply_text.await_args.args[0]
+        first, second = text.split("\n")
+        self.assertEqual(first, "📭 No tasks in the queue.")
+        self.assertTrue(second)
+        self.assertEqual(update.message.reply_text.await_args.kwargs["parse_mode"], "HTML")
+
+    async def test_a_failing_celebration_never_breaks_the_removal(self):
+        self.add_task(55)
+        with patch.object(bot.cheer_writer, "empty_queue_celebration", side_effect=RuntimeError("boom")):
+            update, _ = await self.command("!wdone 55")
+
+        self.assertEqual(self.db.get_tasks(1), [])
+        self.assertEqual(update.message.reply_text.await_args.args[0],
+                         'Removed <a href="https://github.com/owner/repo/pull/55">repo/55</a> (added by @author)')
 
     async def test_a_failing_cheer_never_breaks_the_command(self):
         self.add_task(55)
