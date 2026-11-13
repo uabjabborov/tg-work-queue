@@ -420,13 +420,16 @@ class Database:
                 if (row["chat_id"], (row["review_host"], row["review_project"], row["review_number"])) not in queued
             ]
 
-    def mark_merged(self, activity_id: int, merged_by: str, merged_by_id: Optional[int] = None,
+    def mark_merged(self, activity_ids: list[int], merged_by: str, merged_by_id: Optional[int] = None,
                     now: Optional[datetime] = None) -> None:
+        if not activity_ids:
+            return
+        timestamp = utc_timestamp(now)
         with self._get_connection() as conn:
-            conn.execute("""
+            conn.executemany("""
                 INSERT OR IGNORE INTO merged_reviews (activity_id, merged_by, merged_by_id, merged_at)
                 VALUES (?, ?, ?, ?)
-            """, (activity_id, merged_by, merged_by_id, utc_timestamp(now)))
+            """, [(activity_id, merged_by, merged_by_id, timestamp) for activity_id in activity_ids])
 
     def clear_finished_reviews(self, activity_ids: list[int], cleared_by: str, cleared_by_id: Optional[int] = None,
                                now: Optional[datetime] = None) -> None:
@@ -465,11 +468,34 @@ class Database:
         return self._complete_task(chat_id, "id", task_db_id, outcome, completed_by,
                                    completed_by_id, completed_at)
 
+    def complete_tasks(self, chat_id: int, task_db_ids: list[int], outcome: str, completed_by: str,
+                       completed_by_id: Optional[int] = None, completed_at: Optional[datetime] = None) -> list[Task]:
+        """Archive and remove these queue entries in one transaction: all of them or, on error, none.
+
+        Returns the removed tasks; entries already gone from the queue are skipped.
+        """
+        self._check_outcome(outcome)
+        if not task_db_ids:
+            return []
+        with self._get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            removed = []
+            for task_db_id in task_db_ids:
+                row = conn.execute("SELECT * FROM tasks WHERE chat_id = ? AND id = ?", (chat_id, task_db_id)).fetchone()
+                if row is not None:
+                    removed.append(self._archive_task(conn, chat_id, row, outcome, completed_by, completed_by_id,
+                                                      completed_at))
+            return removed
+
+    @staticmethod
+    def _check_outcome(outcome: str) -> None:
+        if outcome not in ("done", "bounce"):
+            raise ValueError("Outcome must be done or bounce")
+
     def _complete_task(self, chat_id: int, column: str, value: int | str, outcome: str,
                        completed_by: str, completed_by_id: Optional[int] = None,
                        completed_at: Optional[datetime] = None) -> Optional[Task]:
-        if outcome not in ("done", "bounce"):
-            raise ValueError("Outcome must be done or bounce")
+        self._check_outcome(outcome)
         with self._get_connection() as conn:
             # Serialize the read and deletion so repeated commands cannot create events.
             conn.execute("BEGIN IMMEDIATE")
@@ -479,22 +505,25 @@ class Database:
             ).fetchone()
             if row is None:
                 return None
+            return self._archive_task(conn, chat_id, row, outcome, completed_by, completed_by_id, completed_at)
 
-            task = self._row_to_task(conn, row)
-            parsed = parse_review_url(task.url)
-            identity = parsed[1] if parsed else (None, None, None)
-            timestamp = utc_timestamp(completed_at)
-            conn.execute("""
-                INSERT INTO review_activity (
-                    queue_task_id, chat_id, task_id, url, review_host, review_project, review_number,
-                    outcome, created_by, created_by_id, completed_by, completed_by_id, completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (task.id, chat_id, task.task_id, task.url, *identity, outcome,
-                  task.created_by, task.created_by_id, completed_by, completed_by_id, timestamp))
-            self._record_user(conn, chat_id, completed_by_id, completed_by, timestamp)
-            conn.execute("DELETE FROM task_assignees WHERE task_id = ?", (task.id,))
-            conn.execute("DELETE FROM tasks WHERE id = ?", (task.id,))
-            return task
+    def _archive_task(self, conn: sqlite3.Connection, chat_id: int, row: sqlite3.Row, outcome: str,
+                      completed_by: str, completed_by_id: Optional[int], completed_at: Optional[datetime]) -> Task:
+        task = self._row_to_task(conn, row)
+        parsed = parse_review_url(task.url)
+        identity = parsed[1] if parsed else (None, None, None)
+        timestamp = utc_timestamp(completed_at)
+        conn.execute("""
+            INSERT INTO review_activity (
+                queue_task_id, chat_id, task_id, url, review_host, review_project, review_number,
+                outcome, created_by, created_by_id, completed_by, completed_by_id, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (task.id, chat_id, task.task_id, task.url, *identity, outcome,
+              task.created_by, task.created_by_id, completed_by, completed_by_id, timestamp))
+        self._record_user(conn, chat_id, completed_by_id, completed_by, timestamp)
+        conn.execute("DELETE FROM task_assignees WHERE task_id = ?", (task.id,))
+        conn.execute("DELETE FROM tasks WHERE id = ?", (task.id,))
+        return task
 
     def get_review_activity(self, chat_id: int, start: datetime, end: datetime) -> list[ReviewActivity]:
         """Fetch activity by UTC completion time, with an exclusive end boundary."""
@@ -605,46 +634,27 @@ class Database:
             row = cursor.fetchone()
             return self._row_to_task(conn, row)
 
-    def update_task_assignees_by_id(self, chat_id: int, task_id: str, assignees: list[str]) -> Optional[Task]:
-        """Update a task's assignees by task_id and return the updated task, or None if not found."""
+    def assign_tasks(self, chat_id: int, assignments: list[tuple[int, list[str]]]) -> list[Task]:
+        """Replace the assignees of queue entries, given as (task database id, assignees), in one
+        transaction: all of them or, on error, none.
+
+        Returns the updated tasks; entries already gone from the queue are skipped.
+        """
+        if not assignments:
+            return []
         with self._get_connection() as conn:
-            cursor = conn.execute(
-                """
-                SELECT *
-                FROM tasks
-                WHERE chat_id = ? AND task_id = ?
-                """,
-                (chat_id, task_id)
-            )
-            row = cursor.fetchone()
-            
-            if row is None:
-                return None
-            
-            task_db_id = row["id"]
-            
-            # Update assignees in junction table
-            self._set_task_assignees(conn, task_db_id, assignees)
-            
-            # Update assigned_to for backward compatibility
-            assigned_to = assignees[0] if assignees else "unassigned"
-            conn.execute(
-                "UPDATE tasks SET assigned_to = ? WHERE chat_id = ? AND task_id = ?",
-                (assigned_to, chat_id, task_id)
-            )
-            conn.commit()
-            
-            # Return updated task
-            cursor = conn.execute(
-                """
-                SELECT *
-                FROM tasks
-                WHERE chat_id = ? AND task_id = ?
-                """,
-                (chat_id, task_id)
-            )
-            row = cursor.fetchone()
-            return self._row_to_task(conn, row)
+            conn.execute("BEGIN IMMEDIATE")
+            updated = []
+            for task_db_id, assignees in assignments:
+                row = conn.execute("SELECT * FROM tasks WHERE chat_id = ? AND id = ?", (chat_id, task_db_id)).fetchone()
+                if row is None:
+                    continue
+                self._set_task_assignees(conn, task_db_id, assignees)
+                # assigned_to is kept for backward compatibility.
+                conn.execute("UPDATE tasks SET assigned_to = ? WHERE id = ?",
+                             (assignees[0] if assignees else "unassigned", task_db_id))
+                updated.append(self._row_to_task(conn, row))
+            return updated
 
     def set_reminder(self, chat_id: int, cron_expression: str, enabled: bool = True) -> None:
         """Set or update a reminder configuration for a chat."""
