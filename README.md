@@ -95,6 +95,14 @@ Create a `.env` file with your bot token:
 TELEGRAM_BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
 ```
 
+Optionally, let Claude write the [reviewer cheers](#reviewer-cheers-wdone--wbounce) (a paid API; without a key, cheers come from the free built-in library):
+
+```
+ANTHROPIC_API_KEY=sk-ant-...
+# Optional: another Claude model (default claude-haiku-5-5), or CHEERS_AI=off to keep the key but use templates
+CHEERS_MODEL=claude-haiku-5-5
+```
+
 ### 3. Install Dependencies
 
 ```bash
@@ -105,6 +113,7 @@ This includes:
 - `python-telegram-bot` - Telegram Bot API wrapper
 - `python-dotenv` - Environment variable management
 - `APScheduler` - Cron-based reminder scheduling
+- `anthropic` - Claude API client for optional AI-written reviewer cheers (only used when `ANTHROPIC_API_KEY` is set)
 
 ### 4. Run the Bot
 
@@ -319,6 +328,7 @@ Reminders use 5-part cron expressions in UTC timezone:
 - **Private Assignment View**: `!wme` replies with an ephemeral message only the sender can see, including your PRs/MRs that are ready to merge or need changes
 - **Custom Reminders**: Each channel can configure its own reminder schedule
 - **Weekly Leaderboards**: Separate contributor and reviewer rankings and Monday recaps for each chat
+- **Reviewer Cheers**: After `!wdone` or `!wbounce`, the reviewer privately gets a playful message about their speed or bounce round, and the chat celebrates when the queue becomes empty
 - **Persistent Storage**: Data is stored in SQLite database (`workqueue.db`)
 - **Flexible Assignment**: Reassign tasks at any time, replacing all existing assignees
 
@@ -343,6 +353,56 @@ Only each PR/MR's latest outcome counts: re-adding one takes it off the list, an
 - `!wclear` clears before it replies, so if the private reply fails, the public notice still says how many PRs/MRs were cleared (without naming them). Sending `!wclear` again won't show them.
 - Your `!wme` or `!wclear` message itself stays visible to the group; only the reply is private. Usage and invalid-reference errors from `!wclear` are still public, since they don't list your PRs/MRs. When `!wmerged` matches several of your approved PRs/MRs, that list is private too.
 - In a direct message with the bot, `!wme` lists your reviews from all groups you're still a member of, as a normal reply, under each group's name. If Telegram can't confirm your membership in a group right now (for example, a timeout), the reply says so and you can send `!wme` again.
+
+## Reviewer Cheers (`!wdone` / `!wbounce`)
+
+After `!wdone` or `!wbounce`, the reviewer gets a short, playful message that only they can see (an ephemeral message, like `!wme`). Nothing changes for the rest of the chat.
+
+The first line states the facts: the review, and for `!wdone` how long it waited in the queue since `!wadd`, or for `!wbounce` how many times that PR/MR has been bounced in this chat. Commands covering several reviews show the count, plus the fastest approval or the most-bounced PR/MR. The second line is a quip in a mix of English, Uzbek and Russian:
+
+| Situation | Tier | Example |
+|-----------|------|---------|
+| `!wdone` under 10 minutes | ⚡ | "Is your real name Barry Allen? ⚡" |
+| `!wdone` under 1 hour | 🚀 | "Спидран ревью засчитан 🏁" |
+| `!wdone` under 4 hours | 💪 | "Hech kim eslatmasdan oldin bajardingiz. Hurmat!" |
+| `!wdone` under 24 hours | 🐢 | "Хорошее ревью как плов — требует времени 🍚" |
+| `!wdone` after a day or more | 🦖 | "Archaeologists have officially carbon-dated this PR 🦖" |
+| First `!wbounce` of a PR/MR | 🛡️ | "You shall not pass! 🧙 Quality gate held." |
+| Second `!wbounce` | 🥊 | "2-raund! Jang! 🥊" |
+| Third or later `!wbounce` | 🔁 | "Раунд 3... Этот PR уже как сериал 📺 Может, созвон на 5 минут?" |
+
+- **Free by default:** quips are mixed from a library of about 280 lines in `cheer_lines.py`: an opener, a tier line, a combo line for three or more reviews, and a closer, each in any of the three languages. Many lines have fill-ins, such as "Faster than {a cheetah on espresso / gossip in the office kitchen / …}", so the same line reads differently each time. That gives 12,000–110,000 different messages per tier, and a person doesn't get the same tier line again within their last 12 cheers (kept in memory until restart). To add lines, edit `cheer_lines.py`; the tests check every line for placeholders, slot languages, and Russian number agreement.
+- **Optional, paid: Claude-written quips.** With `ANTHROPIC_API_KEY` set, Claude writes every quip from scratch instead. This is billed per message by the Anthropic API. Claude only gets the tier, the wait or bounce round, the number of reviews, and the person's last few quips (so it avoids them). It never gets names, chats, or PR/MR links. It uses the smallest model, Claude Haiku 5.5, at low effort with at most 1,024 tokens per quip, so each cheer costs a fraction of a cent. If Claude doesn't answer within 8 seconds, errors, or declines, the bot falls back to the free library without retrying. Set `CHEERS_MODEL` to use a bigger model, or `CHEERS_AI=off` to keep the key but use the library.
+- Reviewing your own PR/MR earns no cheer, using the same rules as the leaderboard (including entries saved under an old username). Anonymous admins get none either. Bounce rounds only count reviewers sending the PR/MR back, not its author bouncing it themselves.
+- Cheers are sent in the background after the public "Removed …" reply, so a slow Claude response never holds up the bot. If the private message can't be delivered (for example, the bot isn't a group admin), the cheer is dropped and only logged. The bot posts no notice in the chat. If the Bot API server posts a private message publicly (for example, a self-hosted server without ephemeral support), the bot deletes it and pauses cheers for 24 hours, so later commands don't flash public messages. `!wme` and other requested private replies still try every time. If it can't delete that message, it asks the chat to.
+- Queue time is wall-clock time, so a PR/MR added on Friday evening and reviewed on Monday counts as slow. Slow reviews are teased gently, never shamed.
+
+### Empty queue
+
+Every public message about an empty queue has a funny line and ends with a call to action, such as "👉 Got a PR waiting? Feed the queue: `!wadd <PR/MR link>`". There are three of them:
+
+- **The last review leaves the queue** (`!wdone` or `!wbounce`): the reply celebrates who closed it. Closing your own PR/MR still empties the queue, but isn't credited (same self-review rules as the leaderboard).
+
+  ```
+  Removed repo/55 (added by @bob)
+
+  🎉 Queue is empty! @alice closed the last one.
+  Reviewers 1, queue 0. ⚽
+  👉 Следующий PR, прошу: !wadd <PR/MR link>
+  ```
+
+  To keep quiet chats from getting one after every review, a chat is congratulated at most once an hour, counted from when a celebration was actually sent (tracked in memory until restart).
+- **`!wdone` or `!wbounce` when the queue is already empty**: instead of "not found", the bot names what was asked for, says there's nothing to mark done (or send back), and nudges the chat to add PRs. So someone who just missed a teammate's `!wdone` learns the PR/MR is gone. Usage and invalid-reference errors are still shown as before.
+
+  ```
+  📭 repo/55 isn't in the queue. It's empty, so there's nothing to mark done.
+  404: ревью не найдено 🔍
+  👉 Birinchi bo'lib navbatga turing: !wadd <PR/MR link>
+  ```
+
+- **`!w` on an empty queue**: "📭 No tasks in the queue." plus a funny line and a call to action.
+
+These lines come only from the free library in `cheer_lines.py` (`EMPTY_QUEUE`, `NOTHING_TO_REVIEW`, `CALL_TO_ACTION`), never Claude, and a chat doesn't get the same line again within its last 12. If a fun line can't be built, the bot sends the plain reply instead, so a joke never breaks a command. The in-memory history keeps the 2,000 most recently active people and chats.
 
 ## Notes
 

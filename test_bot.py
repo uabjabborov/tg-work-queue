@@ -31,6 +31,10 @@ class QueueReferenceTests(unittest.IsolatedAsyncioTestCase):
         db_patch = patch.object(bot, "db", self.db)
         db_patch.start()
         self.addCleanup(db_patch.stop)
+        # Private cheers are covered in test_gamification.py.
+        cheer_patch = patch.object(bot, "schedule_cheer")
+        cheer_patch.start()
+        self.addCleanup(cheer_patch.stop)
 
     def add_task(self, chat_id=1, task_id="repo/120", url=None, assignees=None, created_by="@author"):
         repo, number = task_id.split("/")
@@ -124,6 +128,8 @@ class QueueReferenceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_references_are_restricted_to_current_chat(self):
         self.add_task(chat_id=2)
+        # Chat 1 isn't empty, so the references get "not found" rather than the empty-queue nudge.
+        self.add_task(chat_id=1, task_id="other/1")
         references = ("repo/120", "120", "https://github.com/owner/repo/pull/120")
 
         for command in ("wdone", "wbounce", "wassign"):
@@ -507,6 +513,10 @@ class WmeCommandTests(unittest.IsolatedAsyncioTestCase):
         db_patch = patch.object(bot, "db", self.db)
         db_patch.start()
         self.addCleanup(db_patch.stop)
+        # Private cheers are covered in test_gamification.py.
+        cheer_patch = patch.object(bot, "schedule_cheer")
+        cheer_patch.start()
+        self.addCleanup(cheer_patch.stop)
 
     def add_task(self, number, assignees, chat_id=1):
         url = f"https://github.com/owner/repo/pull/{number}"
