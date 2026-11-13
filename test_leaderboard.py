@@ -538,6 +538,10 @@ class LeaderboardCommandTests(DatabaseFixture, unittest.IsolatedAsyncioTestCase)
                                  side_effect=lambda previous=False: reporting_week(ACTIVITY_TIME, previous))
         week_patch.start()
         self.addCleanup(week_patch.stop)
+        # Private cheers are covered in test_gamification.py.
+        cheer_patch = patch.object(bot, "schedule_cheer")
+        cheer_patch.start()
+        self.addCleanup(cheer_patch.stop)
 
     async def command(self, text, user_id=2, username="bob", first_name="Bob", chat_id=1,
                       anonymous=False, unknown=False, bot_sender=False):

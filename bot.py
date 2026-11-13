@@ -2,6 +2,7 @@ import asyncio
 import os
 import re
 import logging
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -13,7 +14,8 @@ from telegram.error import BadRequest, Forbidden, TelegramError, TimedOut
 from html import escape as html_escape
 
 from database import Database, FinishedReview, Task
-from leaderboard import build_leaderboard, format_leaderboard, reporting_week
+from gamification import CheerWriter, approval_cheer, bounce_cheer, queue_wait
+from leaderboard import Identities, build_leaderboard, format_leaderboard, reporting_week
 from presentation import FINISHED_VISIBLE_DAYS, finished_listing, grouped_by_chat, my_reviews, review_link, split_messages, task_listing
 from review_urls import normalize_review_number, parse_review_url
 from scheduler import add_reminder_job, remove_reminder_job, setup_scheduler
@@ -31,6 +33,13 @@ logger = logging.getLogger(__name__)
 
 # Initialize database
 db = Database()
+# Writes the private messages reviewers get after !wdone and !wbounce
+cheer_writer = CheerWriter.from_environment()
+# Cheers are sent in the background; keep references so the tasks aren't garbage-collected.
+cheer_tasks: set[asyncio.Task] = set()
+# Set once a Bot API server posts an ephemeral message publicly. Cheers are unrequested, so they stop
+# until restart instead of flashing a public message (and a notification) after every review command.
+ephemeral_unsupported = False
 
 # Regex patterns for commands
 WADD_PREFIX = re.compile(r"^!wadd\b", re.IGNORECASE)
@@ -379,7 +388,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Check for !wdone command
     wdone_match = WDONE_PATTERN.match(text)
     if wdone_match:
-        await handle_wdone(update, chat_id, wdone_match.group(1).strip())
+        await handle_wdone(update, context, chat_id, wdone_match.group(1).strip())
         return
     elif WDONE_PREFIX.match(text):
         await update.message.reply_text(WDONE_USAGE, parse_mode=ParseMode.HTML)
@@ -388,7 +397,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Check for !wbounce command
     wbounce_match = WBOUNCE_PATTERN.match(text)
     if wbounce_match:
-        await handle_wbounce(update, chat_id, wbounce_match.group(1).strip())
+        await handle_wbounce(update, context, chat_id, wbounce_match.group(1).strip())
         return
     elif WBOUNCE_PREFIX.match(text):
         await update.message.reply_text(WBOUNCE_USAGE, parse_mode=ParseMode.HTML)
@@ -661,13 +670,16 @@ async def member_chat_titles(context: ContextTypes.DEFAULT_TYPE, chat_ids: set[i
 
 
 async def reply_privately(update: Update, context: ContextTypes.DEFAULT_TYPE, texts: list[str],
-                          public_outcome: str | None = None) -> bool:
+                          public_outcome: str | None = None, quiet: bool = False) -> bool:
     """Reply so only the sender sees it; in private chats a normal reply is already private.
 
     Commands that change data pass public_outcome, a summary without any PR/MR links that is posted
     publicly if the private reply fails, since sending such a command again can't recover the reply.
+    Optional extras pass quiet, so a failed private reply is only logged instead of explained in the chat,
+    unless it was posted publicly and couldn't be deleted.
     Returns whether the whole reply was delivered privately.
     """
+    global ephemeral_unsupported
     chat = update.effective_chat
     if chat.type == ChatType.PRIVATE:
         for text in texts:
@@ -686,6 +698,8 @@ async def reply_privately(update: Update, context: ContextTypes.DEFAULT_TYPE, te
             )
         except TelegramError as error:
             logger.warning("Could not send ephemeral reply in chat %s: %r", chat.id, error)
+            if quiet:
+                return False
             failure = await private_reply_failure(context, chat.id, error, can_resend=public_outcome is None)
             await update.message.reply_text(prefix + failure, parse_mode=ParseMode.HTML)
             return False
@@ -693,13 +707,21 @@ async def reply_privately(update: Update, context: ContextTypes.DEFAULT_TYPE, te
         # The Bot API ignores parameters it doesn't know, so a server without ephemeral support
         # would post publicly. Ephemeral messages are the only ones returned with message ID 0.
         if sent.message_id != 0:
+            ephemeral_unsupported = True
             logger.error("Ephemeral reply in chat %s was posted publicly; deleting it", chat.id)
             notice = "This Telegram server doesn't support private replies, so I can't show that here."
             try:
                 await context.bot.delete_message(chat.id, sent.message_id)
             except TelegramError:
                 logger.exception("Could not delete public reply %s in chat %s", sent.message_id, chat.id)
-                notice += " My reply was posted publicly and I couldn't delete it, so please delete it."
+                # Even an optional extra must not stay public without anyone being told.
+                if quiet:
+                    notice = "My private note was posted publicly and I couldn't delete it, so please delete it."
+                else:
+                    notice += " My reply was posted publicly and I couldn't delete it, so please delete it."
+            else:
+                if quiet:
+                    return False
             await update.message.reply_text(prefix + notice, parse_mode=ParseMode.HTML)
             return False
     return True
@@ -727,18 +749,19 @@ async def private_reply_failure(context: ContextTypes.DEFAULT_TYPE, chat_id: int
     return "I couldn't reply privately right now."
 
 
-async def handle_wdone(update: Update, chat_id: int, args: str) -> None:
+async def handle_wdone(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, args: str) -> None:
     """Handle !wdone command - remove tasks by PR/MR reference, number, or number range."""
-    await handle_remove_tasks(update, chat_id, args, outcome="done", usage=WDONE_USAGE)
+    await handle_remove_tasks(update, context, chat_id, args, outcome="done", usage=WDONE_USAGE)
 
 
-async def handle_wbounce(update: Update, chat_id: int, args: str) -> None:
+async def handle_wbounce(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, args: str) -> None:
     """Handle !wbounce command - remove tasks that require changes."""
-    await handle_remove_tasks(update, chat_id, args, outcome="bounce", usage=WBOUNCE_USAGE, comment="Changes required.")
+    await handle_remove_tasks(update, context, chat_id, args, outcome="bounce", usage=WBOUNCE_USAGE,
+                              comment="Changes required.")
 
 
-async def handle_remove_tasks(update: Update, chat_id: int, args: str, outcome: str, usage: str,
-                              comment: Optional[str] = None) -> None:
+async def handle_remove_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, args: str,
+                              outcome: str, usage: str, comment: Optional[str] = None) -> None:
     """Remove the referenced tasks in one transaction and report what was removed and what wasn't."""
     references = split_references(args)
     if not references:
@@ -772,6 +795,48 @@ async def handle_remove_tasks(update: Update, chat_id: int, args: str, outcome: 
     blocks += queue_problem_blocks(resolution, [task for task in tasks if task.id not in removed_ids])
     await reply_blocks(update, blocks)
     logger.info(f"Removed {len(removed)} tasks ({outcome}) from chat {chat_id}")
+    if removed:
+        schedule_cheer(update, context, chat_id, removed, outcome)
+
+
+def schedule_cheer(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, removed: list[Task],
+                   outcome: str) -> None:
+    """Privately cheer the reviewer in the background, so writing the message never delays the bot."""
+    task = asyncio.create_task(send_cheer(update, context, chat_id, removed, outcome, datetime.now(timezone.utc)))
+    cheer_tasks.add(task)
+    task.add_done_callback(cheer_tasks.discard)
+
+
+async def send_cheer(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, removed: list[Task],
+                     outcome: str, now: datetime) -> None:
+    """Send the reviewer a playful message only they can see. Reviews of their own PRs/MRs don't count,
+    and a cheer that can't be delivered is dropped quietly instead of bothering the chat."""
+    try:
+        sender_id, sender = sender_identity(update)
+        if sender_id is None or (ephemeral_unsupported and update.effective_chat.type != ChatType.PRIVATE):
+            return
+        # Same self-review rules as the leaderboard, including legacy names of renamed users.
+        people = Identities(db.get_known_users(chat_id))
+        reviews = [task for task in removed
+                   if not people.is_self_review(task.created_by_id, task.created_by, sender_id, sender)]
+        if outcome == "done":
+            cheer = approval_cheer([(task.task_id, task.url, queue_wait(task.created_at, now)) for task in reviews])
+        else:
+            # Rounds count reviewers sending the PR/MR back, not its author bouncing it themselves.
+            identities = {task.id: parsed[1] for task in reviews if (parsed := parse_review_url(task.url))}
+            rounds = Counter(
+                bounce.review_identity for bounce in db.get_bounces(chat_id, list(identities.values()))
+                if not people.is_self_review(bounce.created_by_id, bounce.created_by,
+                                             bounce.completed_by_id, bounce.completed_by)
+            )
+            cheer = bounce_cheer([(task.task_id, task.url, max(1, rounds[identities.get(task.id)]))
+                                  for task in reviews])
+        if cheer is None:
+            return
+        text = await cheer_writer.message(cheer, sender_id)
+        await reply_privately(update, context, [text], quiet=True)
+    except Exception:
+        logger.exception("Could not cheer the reviewer in chat %s", chat_id)
 
 
 async def handle_wleaderboard(update: Update, chat_id: int, previous: bool = False) -> None:
@@ -821,6 +886,7 @@ Examples: <code>!wdone repo/123</code>, <code>!wdone 123</code>, <code>!wdone 1 
 <code>!wbounce &lt;PR/MR references&gt;</code>
 Remove tasks with a Changes required comment
 Examples: <code>!wbounce repo/123</code>, <code>!wbounce 123</code>, <code>!wbounce 1 2 3</code>, or <code>!wbounce 1-3</code>
+After <code>!wdone</code> or <code>!wbounce</code>, the reviewer privately gets a playful note about their speed or bounce round
 
 <code>!wassign &lt;PR/MR references&gt; @username [...]</code>
 Assign or reassign tasks (replaces all existing assignees)

@@ -31,6 +31,10 @@ class QueueReferenceTests(unittest.IsolatedAsyncioTestCase):
         db_patch = patch.object(bot, "db", self.db)
         db_patch.start()
         self.addCleanup(db_patch.stop)
+        # Private cheers are covered in test_gamification.py.
+        cheer_patch = patch.object(bot, "schedule_cheer")
+        cheer_patch.start()
+        self.addCleanup(cheer_patch.stop)
 
     def add_task(self, chat_id=1, task_id="repo/120", url=None, assignees=None, created_by="@author"):
         repo, number = task_id.split("/")
@@ -507,6 +511,10 @@ class WmeCommandTests(unittest.IsolatedAsyncioTestCase):
         db_patch = patch.object(bot, "db", self.db)
         db_patch.start()
         self.addCleanup(db_patch.stop)
+        # Private cheers are covered in test_gamification.py.
+        cheer_patch = patch.object(bot, "schedule_cheer")
+        cheer_patch.start()
+        self.addCleanup(cheer_patch.stop)
 
     def add_task(self, number, assignees, chat_id=1):
         url = f"https://github.com/owner/repo/pull/{number}"

@@ -533,15 +533,33 @@ class Database:
                 WHERE chat_id = ? AND completed_at >= ? AND completed_at < ?
                 ORDER BY completed_at, id
             """, (chat_id, utc_timestamp(start), utc_timestamp(end))).fetchall()
-            return [ReviewActivity(
-                chat_id=row["chat_id"],
-                review_identity=(row["review_host"], row["review_project"], row["review_number"])
-                    if row["review_host"] is not None else None,
-                outcome=row["outcome"],
-                created_by=row["created_by"], created_by_id=row["created_by_id"],
-                completed_by=row["completed_by"], completed_by_id=row["completed_by_id"],
-                completed_at=datetime.fromisoformat(row["completed_at"])
-            ) for row in rows]
+            return [self._row_to_activity(row) for row in rows]
+
+    def get_bounces(self, chat_id: int, identities: list[tuple[str, str, str]]) -> list[ReviewActivity]:
+        """Every bounce in this chat of the PRs/MRs with these URL identities, in one query."""
+        identities = sorted(set(identities))
+        if not identities:
+            return []
+        matches = " OR ".join(["(review_host = ? AND review_project = ? AND review_number = ?)"] * len(identities))
+        with self._get_connection() as conn:
+            rows = conn.execute(f"""
+                SELECT * FROM review_activity
+                WHERE chat_id = ? AND outcome = 'bounce' AND ({matches})
+                ORDER BY completed_at, id
+            """, (chat_id, *(part for identity in identities for part in identity))).fetchall()
+            return [self._row_to_activity(row) for row in rows]
+
+    @staticmethod
+    def _row_to_activity(row: sqlite3.Row) -> ReviewActivity:
+        return ReviewActivity(
+            chat_id=row["chat_id"],
+            review_identity=(row["review_host"], row["review_project"], row["review_number"])
+                if row["review_host"] is not None else None,
+            outcome=row["outcome"],
+            created_by=row["created_by"], created_by_id=row["created_by_id"],
+            completed_by=row["completed_by"], completed_by_id=row["completed_by_id"],
+            completed_at=datetime.fromisoformat(row["completed_at"])
+        )
 
     def get_known_users(self, chat_id: int) -> list[tuple[int, str]]:
         """Return all observed names, oldest first, to retain rename and ambiguity evidence."""
