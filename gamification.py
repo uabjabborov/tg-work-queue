@@ -9,7 +9,7 @@ never names, chats or links.
 import logging
 import os
 import random
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from html import escape as html_escape
@@ -21,6 +21,18 @@ from cheer_lines import (
 from presentation import review_link
 
 logger = logging.getLogger(__name__)
+
+
+def remember(store: OrderedDict, key, make):
+    """Return store[key], creating it with make() if needed, and forget the least recently used keys
+    beyond MEMORY_LIMIT so a long-running bot's history stays bounded."""
+    if key in store:
+        store.move_to_end(key)
+    else:
+        store[key] = make()
+        while len(store) > MEMORY_LIMIT:
+            store.popitem(last=False)
+    return store[key]
 
 # Speed tiers for approvals, by the time from !wadd to !wdone of the fastest review in the command.
 SPEED_TIERS = (
@@ -38,6 +50,8 @@ TIER_EMOJI = {
 COMBO_SIZE = 3
 # Quips a person saw recently are avoided, so the same line doesn't come back soon.
 RECENT_PER_PERSON = 12
+# How many people or chats the in-memory history keeps; the least recently active are forgotten first.
+MEMORY_LIMIT = 2000
 MAX_QUIP_LENGTH = 300
 # The public "queue is empty" celebration is posted at most this often per chat, so a quiet chat where
 # every !wdone empties the queue doesn't get one each time.
@@ -244,12 +258,12 @@ class CheerWriter:
         self.model = model or os.getenv("CHEERS_MODEL", DEFAULT_MODEL)
         self.rng = rng or random.Random()
         # Template lines each person got recently, so the library avoids repeating them.
-        self.recent_lines: dict[object, deque] = {}
+        self.recent_lines: OrderedDict[object, deque] = OrderedDict()
         # The quips each person actually saw, so Claude avoids repeating them.
-        self.recent_quips: dict[object, deque] = {}
+        self.recent_quips: OrderedDict[object, deque] = OrderedDict()
         # Public lines each chat saw recently, by pool, and when each chat was last congratulated.
-        self.recent_public_lines: dict[tuple[int, str], deque] = {}
-        self.last_empty_celebration: dict[int, datetime] = {}
+        self.recent_public_lines: OrderedDict[tuple[int, str], deque] = OrderedDict()
+        self.last_empty_celebration: OrderedDict[int, datetime] = OrderedDict()
 
     @classmethod
     def from_environment(cls) -> "CheerWriter":
@@ -264,7 +278,7 @@ class CheerWriter:
         return cls(client)
 
     async def quip(self, cheer: Cheer, person) -> str:
-        seen = self.recent_quips.setdefault(person, deque(maxlen=RECENT_PER_PERSON))
+        seen = remember(self.recent_quips, person, lambda: deque(maxlen=RECENT_PER_PERSON))
         text = None
         if self.client is not None:
             try:
@@ -272,7 +286,7 @@ class CheerWriter:
             except Exception:
                 logger.exception("Claude's cheer could not be read; using the line library")
         if not text:
-            lines = self.recent_lines.setdefault(person, deque(maxlen=RECENT_PER_PERSON))
+            lines = remember(self.recent_lines, person, lambda: deque(maxlen=RECENT_PER_PERSON))
             text = template_quip(cheer, self.rng, lines)
         seen.append(text)
         return html_escape(text, quote=False)
@@ -307,7 +321,7 @@ class CheerWriter:
 
     def public_line(self, chat_id: int, name: str, pool: dict[str, list[str]],
                     opener_mood: Optional[str] = None) -> str:
-        recent = self.recent_public_lines.setdefault((chat_id, name), deque(maxlen=RECENT_PER_PERSON))
+        recent = remember(self.recent_public_lines, (chat_id, name), lambda: deque(maxlen=RECENT_PER_PERSON))
         return html_escape(public_quip(pool, self.rng, recent, opener_mood), quote=False)
 
     def call_to_action(self, chat_id: int) -> str:
@@ -318,23 +332,29 @@ class CheerWriter:
         return (f"📭 No tasks in the queue.\n{self.public_line(chat_id, 'empty', EMPTY_QUEUE, 'hype')}\n"
                 f"{self.call_to_action(chat_id)}")
 
-    def nothing_to_review(self, chat_id: int, outcome: str) -> str:
-        """The reply to !wdone or !wbounce when the queue is already empty, in HTML."""
+    def nothing_to_review(self, chat_id: int, outcome: str, references: str, several: bool) -> str:
+        """The reply to !wdone or !wbounce when the queue is already empty, in HTML. references is the
+        HTML list of what was asked for, so someone who just missed a removal learns it's gone."""
         action = "mark done" if outcome == "done" else "send back"
-        return (f"📭 The queue is empty, so there's nothing to {action}.\n"
+        verb = "aren't" if several else "isn't"
+        return (f"📭 {references} {verb} in the queue. It's empty, so there's nothing to {action}.\n"
                 f"{self.public_line(chat_id, 'nothing', NOTHING_TO_REVIEW, 'tease')}\n{self.call_to_action(chat_id)}")
 
     def empty_queue_celebration(self, chat_id: int, closer: Optional[str], now: datetime) -> Optional[str]:
-        """The public note after the last review leaves the queue, or None if this chat had one recently."""
+        """The public note after the last review leaves the queue, or None if this chat had one recently.
+        Call celebrated() once it was sent, so a note that never arrived doesn't use up the hour."""
         last = self.last_empty_celebration.get(chat_id)
         if last is not None and now - last < EMPTY_QUEUE_COOLDOWN:
             return None
-        self.last_empty_celebration[chat_id] = now
         headline = "🎉 <b>Queue is empty!</b>"
         if closer:
             headline += f" {html_escape(closer)} closed the last one."
         return (f"{headline}\n{self.public_line(chat_id, 'empty', EMPTY_QUEUE, 'hype')}\n"
                 f"{self.call_to_action(chat_id)}")
+
+    def celebrated(self, chat_id: int, now: datetime) -> None:
+        remember(self.last_empty_celebration, chat_id, lambda: now)
+        self.last_empty_celebration[chat_id] = now
 
     async def message(self, cheer: Cheer, person) -> str:
         return f"{header(cheer)}\n{await self.quip(cheer, person)}"

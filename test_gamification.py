@@ -143,6 +143,13 @@ class LineLibraryTests(unittest.TestCase):
                         # Public lines don't describe a particular review.
                         self.assertNotRegex(line, r"\{(time|count|round)\}")
 
+    def test_openers_used_in_public_lines_have_no_review_facts(self):
+        # Public lines are filled with slots only, so {time}, {count} or {round} there would break !w.
+        for mood in ("hype", "tease"):
+            for line in (line for lines in OPENERS[mood].values() for line in lines):
+                with self.subTest(mood=mood, line=line):
+                    self.assertNotRegex(line, r"\{(time|count|round)\}")
+
     def test_calls_to_action_lead_into_the_add_command(self):
         for line in (line for lines in CALL_TO_ACTION.values() for line in lines):
             with self.subTest(line=line):
@@ -276,6 +283,24 @@ class WriterTests(unittest.IsolatedAsyncioTestCase):
                 # The template line the person got is remembered, Claude's rejected text isn't.
                 self.assertIn(writer.recent_lines[7][-1], [line for lines in BODIES["flash"].values() for line in lines])
 
+    async def test_history_forgets_the_least_recently_active_people(self):
+        writer = CheerWriter(rng=random.Random(0))
+        with patch("gamification.MEMORY_LIMIT", 3):
+            for person in range(5):
+                await writer.message(cheer(), person=person)
+            await writer.message(cheer(), person=2)
+            writer.public_line(1, "empty", EMPTY_QUEUE)
+        self.assertEqual(list(writer.recent_lines), [3, 4, 2])
+        self.assertEqual(list(writer.recent_quips), [3, 4, 2])
+
+    def test_celebration_hour_starts_when_it_was_sent(self):
+        writer, now = CheerWriter(rng=random.Random(0)), datetime(2026, 11, 13, tzinfo=timezone.utc)
+        self.assertIsNotNone(writer.empty_queue_celebration(1, "@alice", now))
+        self.assertIsNotNone(writer.empty_queue_celebration(1, "@alice", now))
+        writer.celebrated(1, now)
+        self.assertIsNone(writer.empty_queue_celebration(1, "@alice", now + EMPTY_QUEUE_COOLDOWN / 2))
+        self.assertIsNotNone(writer.empty_queue_celebration(1, "@alice", now + EMPTY_QUEUE_COOLDOWN))
+
     def test_claude_is_used_only_with_an_api_key_and_not_switched_off(self):
         with patch.dict("os.environ", {}, clear=True):
             self.assertIsNone(CheerWriter.from_environment().client)
@@ -297,7 +322,7 @@ class BotCheerTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(temp_dir.cleanup)
         self.db = Database(str(Path(temp_dir.name) / "workqueue.db"))
         for name, value in (("db", self.db), ("cheer_writer", CheerWriter(rng=random.Random(0))),
-                            ("ephemeral_unsupported", False)):
+                            ("ephemeral_paused_until", None)):
             patcher = patch.object(bot, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -318,8 +343,11 @@ class BotCheerTests(unittest.IsolatedAsyncioTestCase):
             id=99, send_message=send_message or AsyncMock(return_value=SimpleNamespace(message_id=0)),
             delete_message=delete_message or AsyncMock(), get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member")),
         )
-        await bot.handle_message(update, SimpleNamespace(bot=telegram_bot))
-        await asyncio.gather(*bot.cheer_tasks)
+        tasks = []
+        application = SimpleNamespace(
+            create_task=lambda coroutine, name=None: tasks.append(asyncio.create_task(coroutine)))
+        await bot.handle_message(update, SimpleNamespace(bot=telegram_bot, application=application))
+        await asyncio.gather(*tasks)
         return update, telegram_bot
 
     async def test_fast_approval_gets_a_private_flash_cheer(self):
@@ -373,6 +401,12 @@ class BotCheerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(telegram_bot.send_message.await_args.args[1].splitlines()[0],
                          '🛡️ <a href="https://github.com/owner/repo/pull/55">repo/55</a>')
 
+    def test_has_tasks_checks_one_chat(self):
+        self.assertFalse(self.db.has_tasks(1))
+        self.add_task(55)
+        self.assertTrue(self.db.has_tasks(1))
+        self.assertFalse(self.db.has_tasks(2))
+
     def test_bounces_of_several_prs_are_fetched_together(self):
         for chat_id, number in ((1, 55), (1, 56), (1, 57), (2, 55)):
             self.db.add_task(chat_id, f"repo/{number}", f"https://github.com/owner/repo/pull/{number}", [], "@a", 1)
@@ -410,6 +444,27 @@ class BotCheerTests(unittest.IsolatedAsyncioTestCase):
         telegram_bot.send_message.assert_awaited_once()
         update.message.reply_text.assert_awaited_once()
 
+    async def test_cheers_resume_a_day_after_a_public_post(self):
+        self.add_task(55)
+        bot.ephemeral_paused_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+        _, telegram_bot = await self.command("!wdone 55")
+
+        telegram_bot.send_message.assert_awaited_once()
+
+    async def test_a_cheer_written_while_another_found_public_posts_is_not_sent(self):
+        self.add_task(55)
+
+        async def slow_writer(cheer, person):
+            # Meanwhile another cheer finds that this server posts private messages publicly.
+            bot.ephemeral_paused_until = datetime.now(timezone.utc) + timedelta(hours=1)
+            return "text"
+
+        with patch.object(bot.cheer_writer, "message", side_effect=slow_writer):
+            _, telegram_bot = await self.command("!wdone 55")
+
+        telegram_bot.send_message.assert_not_awaited()
+
     async def test_cheer_posted_publicly_is_deleted_and_cheers_stop(self):
         self.add_task(55)
         self.add_task(56)
@@ -419,7 +474,8 @@ class BotCheerTests(unittest.IsolatedAsyncioTestCase):
 
         telegram_bot.delete_message.assert_awaited_once_with(1, 42)
         update.message.reply_text.assert_awaited_once()
-        # The server can't send private messages, so later commands don't flash public ones.
+        # The server can't send private messages, so later commands don't flash public ones for a day.
+        self.assertGreater(bot.ephemeral_paused_until, datetime.now(timezone.utc) + timedelta(hours=23))
         update, telegram_bot = await self.command("!wdone 56", send_message=public)
         public.assert_awaited_once()
         update.message.reply_text.assert_awaited_once()
@@ -457,6 +513,45 @@ class BotCheerTests(unittest.IsolatedAsyncioTestCase):
         update, _ = await self.command("!wdone 58")
         self.assertIn("🎉 <b>Queue is empty!</b>", update.message.reply_text.await_args.args[0])
 
+    async def test_someone_who_just_missed_a_removal_learns_the_pr_is_gone(self):
+        self.add_task(55)
+        await self.command("!wdone repo/55")
+
+        update, _ = await self.command("!wdone repo/55", user_id=8, username="bob")
+
+        self.assertTrue(update.message.reply_text.await_args.args[0].startswith(
+            "📭 <code>repo/55</code> isn't in the queue."))
+
+    async def test_closing_your_own_pr_empties_the_queue_without_credit(self):
+        self.add_task(55, author="@alice", author_id=7)
+
+        update, _ = await self.command("!wdone 55")
+
+        self.assertIn("🎉 <b>Queue is empty!</b>\n", update.message.reply_text.await_args.args[0])
+        self.assertNotIn("closed the last one", update.message.reply_text.await_args.args[0])
+
+    async def test_a_celebration_that_failed_to_send_does_not_use_up_the_hour(self):
+        self.add_task(55)
+        self.add_task(56)
+        await self.command("!wdone 55")
+        with patch.object(bot, "reply_blocks", AsyncMock(side_effect=RuntimeError("Telegram is down"))):
+            with self.assertRaises(RuntimeError):
+                await self.command("!wdone 56")
+        self.assertNotIn(1, bot.cheer_writer.last_empty_celebration)
+
+        self.add_task(57)
+        update, _ = await self.command("!wdone 57")
+
+        self.assertIn("🎉 <b>Queue is empty!</b>", update.message.reply_text.await_args.args[0])
+
+    async def test_broken_fun_lines_fall_back_to_the_plain_replies(self):
+        with patch.object(bot.cheer_writer, "public_line", side_effect=KeyError("count")):
+            update, _ = await self.command("!w")
+            self.assertEqual(update.message.reply_text.await_args.args[0], "No tasks in the queue.")
+            update, _ = await self.command("!wdone 55")
+            self.assertEqual(update.message.reply_text.await_args.args[0],
+                             "<code>55</code> not found: the queue is empty.")
+
     async def test_anonymous_closer_gets_no_name_in_the_celebration(self):
         self.add_task(55)
 
@@ -475,14 +570,18 @@ class BotCheerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(update.message.reply_text.await_args.kwargs["parse_mode"], "HTML")
 
     async def test_finishing_reviews_on_an_empty_queue_gets_a_public_nudge(self):
-        for command, action in (("!wdone 55", "mark done"), ("!wbounce 1-3", "send back"),
-                                ("!wdone https://github.com/owner/repo/pull/9", "mark done")):
+        cases = (
+            ("!wdone 55", "<code>55</code> isn't in the queue. It's empty, so there's nothing to mark done."),
+            ("!wbounce 1-3", "<code>1-3</code> aren't in the queue. It's empty, so there's nothing to send back."),
+            ("!wdone 7, 9", "<code>7</code>, <code>9</code> aren't in the queue. It's empty, so there's nothing to mark done."),
+        )
+        for command, headline in cases:
             with self.subTest(command=command):
                 update, telegram_bot = await self.command(command)
 
                 update.message.reply_text.assert_awaited_once()
                 lines = update.message.reply_text.await_args.args[0].split("\n")
-                self.assertEqual(lines[0], f"📭 The queue is empty, so there's nothing to {action}.")
+                self.assertEqual(lines[0], f"📭 {headline}")
                 self.assertEqual(len(lines), 3)
                 self.assertNotRegex(lines[1], r"\{\w+\}")
                 self.assertTrue(lines[2].endswith("<code>!wadd &lt;PR/MR link&gt;</code>"))

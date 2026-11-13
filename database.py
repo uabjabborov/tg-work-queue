@@ -354,6 +354,11 @@ class Database:
             )
             return [self._row_to_task(conn, row) for row in cursor.fetchall()]
 
+    def has_tasks(self, chat_id: int) -> bool:
+        """Whether this chat's queue has any review, without loading the queue and its assignees."""
+        with self._get_connection() as conn:
+            return conn.execute("SELECT EXISTS(SELECT 1 FROM tasks WHERE chat_id = ?)", (chat_id,)).fetchone()[0] == 1
+
     def get_tasks_assigned_to(self, assignee: str, chat_id: Optional[int] = None) -> list[Task]:
         """Get tasks assigned to a @username, ignoring case, in one chat or across all chats."""
         with self._get_connection() as conn:

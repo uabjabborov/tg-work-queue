@@ -35,11 +35,11 @@ logger = logging.getLogger(__name__)
 db = Database()
 # Writes the private messages reviewers get after !wdone and !wbounce
 cheer_writer = CheerWriter.from_environment()
-# Cheers are sent in the background; keep references so the tasks aren't garbage-collected.
-cheer_tasks: set[asyncio.Task] = set()
-# Set once a Bot API server posts an ephemeral message publicly. Cheers are unrequested, so they stop
-# until restart instead of flashing a public message (and a notification) after every review command.
-ephemeral_unsupported = False
+# Set when the Bot API server posts an ephemeral message publicly. Cheers are unrequested, so they pause
+# for a day instead of flashing a public message (and a notification) after every review command; the
+# server is the same for every chat, so the pause is too. Requested private replies (!wme) still try.
+EPHEMERAL_RETRY_AFTER = timedelta(hours=24)
+ephemeral_paused_until: datetime | None = None
 
 # Regex patterns for commands
 WADD_PREFIX = re.compile(r"^!wadd\b", re.IGNORECASE)
@@ -492,7 +492,9 @@ async def handle_w(update: Update, chat_id: int) -> None:
     tasks = db.get_tasks(chat_id)
     
     if not tasks:
-        await update.message.reply_text(cheer_writer.empty_queue_listing(chat_id), parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            public_extra(lambda: cheer_writer.empty_queue_listing(chat_id), "No tasks in the queue."),
+            parse_mode=ParseMode.HTML)
         return
     
     response = "\n".join(task_listing(task) for task in tasks)
@@ -679,7 +681,7 @@ async def reply_privately(update: Update, context: ContextTypes.DEFAULT_TYPE, te
     unless it was posted publicly and couldn't be deleted.
     Returns whether the whole reply was delivered privately.
     """
-    global ephemeral_unsupported
+    global ephemeral_paused_until
     chat = update.effective_chat
     if chat.type == ChatType.PRIVATE:
         for text in texts:
@@ -707,7 +709,7 @@ async def reply_privately(update: Update, context: ContextTypes.DEFAULT_TYPE, te
         # The Bot API ignores parameters it doesn't know, so a server without ephemeral support
         # would post publicly. Ephemeral messages are the only ones returned with message ID 0.
         if sent.message_id != 0:
-            ephemeral_unsupported = True
+            ephemeral_paused_until = datetime.now(timezone.utc) + EPHEMERAL_RETRY_AFTER
             logger.error("Ephemeral reply in chat %s was posted publicly; deleting it", chat.id)
             notice = "This Telegram server doesn't support private replies, so I can't show that here."
             try:
@@ -767,15 +769,20 @@ async def handle_remove_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not references:
         await update.message.reply_text(usage, parse_mode=ParseMode.HTML)
         return
-    # Valid references on an empty queue get a funny nudge to add PRs instead of "not found".
-    if invalid_reference_error(references, "") is None and not db.get_tasks(chat_id):
-        await update.message.reply_text(cheer_writer.nothing_to_review(chat_id, outcome), parse_mode=ParseMode.HTML)
-        return
     resolutions = await resolve_queue_references(update, chat_id, [references])
     if resolutions is None:
         return
 
     resolution = resolutions[0]
+    # On an empty queue nothing can match, so say so with a funny nudge to add PRs instead of "not found".
+    if not resolution.matched and not db.has_tasks(chat_id):
+        several = len(references) > 1 or bool(resolution.ranges)
+        fallback = f"{references_list(references)} not found: the queue is empty."
+        await update.message.reply_text(
+            public_extra(lambda: cheer_writer.nothing_to_review(chat_id, outcome, references_list(references), several),
+                         fallback),
+            parse_mode=ParseMode.HTML)
+        return
     tasks = list(resolution.matched.values())
     completed_by_id, completed_by = sender_identity(update)
     try:
@@ -797,32 +804,57 @@ async def handle_remove_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE
     if removed and comment:
         blocks.append(html_escape(comment))
     blocks += queue_problem_blocks(resolution, [task for task in tasks if task.id not in removed_ids])
-    if removed and (celebration := empty_queue_celebration(chat_id, completed_by_id, completed_by)):
+    now = datetime.now(timezone.utc)
+    celebration = empty_queue_celebration(chat_id, removed, completed_by_id, completed_by, now) if removed else None
+    if celebration:
         blocks.append(f"\n{celebration}")
     await reply_blocks(update, blocks)
+    if celebration:
+        cheer_writer.celebrated(chat_id, now)
     logger.info(f"Removed {len(removed)} tasks ({outcome}) from chat {chat_id}")
     if removed:
         schedule_cheer(update, context, chat_id, removed, outcome)
 
 
-def empty_queue_celebration(chat_id: int, closer_id: int | None, closer: str) -> str | None:
-    """A public note when the queue has just become empty; a failure here never affects the removal."""
+def public_extra(build: Callable[[], str], fallback: str) -> str:
+    """A fun public reply, or the plain one if building it fails, so a joke never breaks a command."""
     try:
-        if db.get_tasks(chat_id):
+        return build()
+    except Exception:
+        logger.exception("Could not build a fun reply; sending the plain one")
+        return fallback
+
+
+def empty_queue_celebration(chat_id: int, removed: list[Task], closer_id: int | None, closer: str,
+                            now: datetime) -> str | None:
+    """A public note when the queue has just become empty; a failure here never affects the removal.
+
+    The closer is credited only for finishing someone else's PR/MR, by the leaderboard's self-review rules.
+    """
+    try:
+        if db.has_tasks(chat_id):
             return None
-        return cheer_writer.empty_queue_celebration(chat_id, closer if closer_id is not None else None,
-                                                    datetime.now(timezone.utc))
+        people = Identities(db.get_known_users(chat_id))
+        credited = closer_id is not None and any(
+            not people.is_self_review(task.created_by_id, task.created_by, closer_id, closer) for task in removed)
+        return cheer_writer.empty_queue_celebration(chat_id, closer if credited else None, now)
     except Exception:
         logger.exception("Could not celebrate the empty queue in chat %s", chat_id)
         return None
 
 
+def cheers_paused(update: Update) -> bool:
+    """Whether cheers in this chat wait because the server recently posted a private message publicly."""
+    return (update.effective_chat.type != ChatType.PRIVATE and ephemeral_paused_until is not None
+            and datetime.now(timezone.utc) < ephemeral_paused_until)
+
+
 def schedule_cheer(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, removed: list[Task],
                    outcome: str) -> None:
-    """Privately cheer the reviewer in the background, so writing the message never delays the bot."""
-    task = asyncio.create_task(send_cheer(update, context, chat_id, removed, outcome, datetime.now(timezone.utc)))
-    cheer_tasks.add(task)
-    task.add_done_callback(cheer_tasks.discard)
+    """Privately cheer the reviewer in the background, so writing the message never delays the bot.
+    The application tracks the task and waits for it when the bot stops, so a restart doesn't drop it."""
+    context.application.create_task(send_cheer(update, context, chat_id, removed, outcome, datetime.now(timezone.utc)),
+                                    name=f"cheer:{chat_id}")
 
 
 async def send_cheer(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, removed: list[Task],
@@ -831,7 +863,7 @@ async def send_cheer(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id
     and a cheer that can't be delivered is dropped quietly instead of bothering the chat."""
     try:
         sender_id, sender = sender_identity(update)
-        if sender_id is None or (ephemeral_unsupported and update.effective_chat.type != ChatType.PRIVATE):
+        if sender_id is None or cheers_paused(update):
             return
         # Same self-review rules as the leaderboard, including legacy names of renamed users.
         people = Identities(db.get_known_users(chat_id))
@@ -852,6 +884,9 @@ async def send_cheer(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id
         if cheer is None:
             return
         text = await cheer_writer.message(cheer, sender_id)
+        # Writing may take seconds with Claude; another cheer may have found the server posts publicly.
+        if cheers_paused(update):
+            return
         await reply_privately(update, context, [text], quiet=True)
     except Exception:
         logger.exception("Could not cheer the reviewer in chat %s", chat_id)

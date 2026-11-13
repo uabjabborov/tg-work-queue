@@ -374,14 +374,14 @@ The first line states the facts: the review, and for `!wdone` how long it waited
 - **Free by default:** quips are mixed from a library of about 280 lines in `cheer_lines.py`: an opener, a tier line, a combo line for three or more reviews, and a closer, each in any of the three languages. Many lines have fill-ins, such as "Faster than {a cheetah on espresso / gossip in the office kitchen / …}", so the same line reads differently each time. That gives 12,000–110,000 different messages per tier, and a person doesn't get the same tier line again within their last 12 cheers (kept in memory until restart). To add lines, edit `cheer_lines.py`; the tests check every line for placeholders, slot languages, and Russian number agreement.
 - **Optional, paid: Claude-written quips.** With `ANTHROPIC_API_KEY` set, Claude writes every quip from scratch instead. This is billed per message by the Anthropic API. Claude only gets the tier, the wait or bounce round, the number of reviews, and the person's last few quips (so it avoids them). It never gets names, chats, or PR/MR links. It uses the smallest model, Claude Haiku 5.5, at low effort with at most 1,024 tokens per quip, so each cheer costs a fraction of a cent. If Claude doesn't answer within 8 seconds, errors, or declines, the bot falls back to the free library without retrying. Set `CHEERS_MODEL` to use a bigger model, or `CHEERS_AI=off` to keep the key but use the library.
 - Reviewing your own PR/MR earns no cheer, using the same rules as the leaderboard (including entries saved under an old username). Anonymous admins get none either. Bounce rounds only count reviewers sending the PR/MR back, not its author bouncing it themselves.
-- Cheers are sent in the background after the public "Removed …" reply, so a slow Claude response never holds up the bot. If the private message can't be delivered (for example, the bot isn't a group admin), the cheer is dropped and only logged. The bot posts no notice in the chat. If the Bot API server posts a private message publicly (for example, a self-hosted server without ephemeral support), the bot deletes it and stops sending cheers until it restarts, so later commands don't flash public messages. If it can't delete that message, it asks the chat to.
+- Cheers are sent in the background after the public "Removed …" reply, so a slow Claude response never holds up the bot. If the private message can't be delivered (for example, the bot isn't a group admin), the cheer is dropped and only logged. The bot posts no notice in the chat. If the Bot API server posts a private message publicly (for example, a self-hosted server without ephemeral support), the bot deletes it and pauses cheers for 24 hours, so later commands don't flash public messages. `!wme` and other requested private replies still try every time. If it can't delete that message, it asks the chat to.
 - Queue time is wall-clock time, so a PR/MR added on Friday evening and reviewed on Monday counts as slow. Slow reviews are teased gently, never shamed.
 
 ### Empty queue
 
 Every public message about an empty queue has a funny line and ends with a call to action, such as "👉 Got a PR waiting? Feed the queue: `!wadd <PR/MR link>`". There are three of them:
 
-- **The last review leaves the queue** (`!wdone` or `!wbounce`): the reply celebrates who closed it.
+- **The last review leaves the queue** (`!wdone` or `!wbounce`): the reply celebrates who closed it. Closing your own PR/MR still empties the queue, but isn't credited (same self-review rules as the leaderboard).
 
   ```
   Removed repo/55 (added by @bob)
@@ -391,18 +391,18 @@ Every public message about an empty queue has a funny line and ends with a call 
   👉 Следующий PR, прошу: !wadd <PR/MR link>
   ```
 
-  To keep quiet chats from getting one after every review, a chat is congratulated at most once an hour (tracked in memory until restart).
-- **`!wdone` or `!wbounce` when the queue is already empty**: instead of "not found", the bot says there's nothing to mark done (or send back) and nudges the chat to add PRs. Usage and invalid-reference errors are still shown as before.
+  To keep quiet chats from getting one after every review, a chat is congratulated at most once an hour, counted from when a celebration was actually sent (tracked in memory until restart).
+- **`!wdone` or `!wbounce` when the queue is already empty**: instead of "not found", the bot names what was asked for, says there's nothing to mark done (or send back), and nudges the chat to add PRs. So someone who just missed a teammate's `!wdone` learns the PR/MR is gone. Usage and invalid-reference errors are still shown as before.
 
   ```
-  📭 The queue is empty, so there's nothing to mark done.
+  📭 repo/55 isn't in the queue. It's empty, so there's nothing to mark done.
   404: ревью не найдено 🔍
   👉 Birinchi bo'lib navbatga turing: !wadd <PR/MR link>
   ```
 
 - **`!w` on an empty queue**: "📭 No tasks in the queue." plus a funny line and a call to action.
 
-These lines come only from the free library in `cheer_lines.py` (`EMPTY_QUEUE`, `NOTHING_TO_REVIEW`, `CALL_TO_ACTION`), never Claude, and a chat doesn't get the same line again within its last 12.
+These lines come only from the free library in `cheer_lines.py` (`EMPTY_QUEUE`, `NOTHING_TO_REVIEW`, `CALL_TO_ACTION`), never Claude, and a chat doesn't get the same line again within its last 12. If a fun line can't be built, the bot sends the plain reply instead, so a joke never breaks a command. The in-memory history keeps the 2,000 most recently active people and chats.
 
 ## Notes
 
