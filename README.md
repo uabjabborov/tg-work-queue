@@ -11,11 +11,11 @@ A Telegram bot that manages task queues for GitLab/GitHub merge requests in chan
 | `!wadd <MR/PR URL> [...] [@username ...]` | Add one or more merge requests (optionally assign to one or more users) |
 | `!w` | List all tasks in the queue |
 | `!wme` | Privately show reviews assigned to you, and your PRs/MRs that were approved (ready to merge) or bounced |
-| `!wmerged <PR/MR reference>` | Mark one of your approved PRs/MRs as merged, so it leaves `!wme` |
+| `!wmerged <PR/MR references>` | Mark your approved PRs/MRs as merged, so they leave `!wme` |
 | `!wclear <PR/MR references>` / `!wclear all` | Clear your approved or bounced PRs/MRs from `!wme` (privately lists what was cleared) |
-| `!wdone <PR/MR reference>` | Remove a completed review |
-| `!wbounce <PR/MR reference>` | Remove a review with a "Changes required" comment in the chat |
-| `!wassign <PR/MR reference> @username [...]` | Assign or reassign a review (replaces all existing assignees) |
+| `!wdone <PR/MR references>` | Remove completed reviews |
+| `!wbounce <PR/MR references>` | Remove reviews with a "Changes required" comment in the chat |
+| `!wassign <PR/MR references> @username [...]` | Assign or reassign reviews (replaces all existing assignees) |
 | `!whelp` | Show help instructions |
 
 ### Reminders
@@ -59,6 +59,25 @@ PR/MR references are derived from the merge request or pull request URL:
 | `https://github.com/owner/repo/pull/45` | `repo/45` |
 
 Use `repo/N`, the full PR/MR URL, or a bare PR/MR number such as `120` with `!wdone`, `!wbounce`, `!wassign`, `!wmerged`, and `!wclear`. A bare number works only when one review in the current chat has that number. If several reviews have it, use a qualified reference such as `monorepo/120`. Queue sequence numbers and legacy `#N` commands are not accepted; use `!w` to see current references.
+
+`!wdone`, `!wbounce`, `!wassign`, `!wmerged`, and `!wclear` also take several references at once, separated by spaces, commas, or new lines, and PR/MR number ranges such as `1-4`, `1..4`, or `1...4`:
+
+```
+!wdone 1 2 3 4
+!wdone 1...4
+!wbounce repo/55, repo/67
+!wassign 55 67 88-90 @alice
+!wmerged 55-60
+```
+
+A range matches every review numbered within it. Because `!wdone`, `!wbounce`, and `!wassign` change the shared queue, a range there is refused if it includes the same number in several repos (use qualified references such as `api/7 web/7` instead), and if the ranges in one command end up covering more than 20 reviews in total, the whole command is rejected. References that match nothing or match several reviews are reported, and the rest are still processed in one transaction. If the database fails, nothing is changed.
+
+`!wassign` gives each run of references to the `@username`s that follow it, so one message can assign different reviews to different people:
+
+```
+!wassign 55 67 @alice
+88 @bob @carol
+```
 
 ## Setup
 

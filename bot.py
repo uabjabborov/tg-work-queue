@@ -3,7 +3,8 @@ import os
 import re
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Callable, Optional
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
@@ -35,20 +36,19 @@ db = Database()
 WADD_PREFIX = re.compile(r"^!wadd\b", re.IGNORECASE)
 W_PATTERN = re.compile(r"^!w$", re.IGNORECASE)
 WME_PATTERN = re.compile(r"^!wme$", re.IGNORECASE)
-WMERGED_PATTERN = re.compile(r"^!wmerged\s+(.+)$", re.IGNORECASE)
+WMERGED_PATTERN = re.compile(r"^!wmerged\s+(.+)$", re.IGNORECASE | re.DOTALL)
 WMERGED_PREFIX = re.compile(r"^!wmerged\b", re.IGNORECASE)
 WCLEAR_PATTERN = re.compile(r"^!wclear\s+(.+)$", re.IGNORECASE | re.DOTALL)
 WCLEAR_PREFIX = re.compile(r"^!wclear\b", re.IGNORECASE)
-WDONE_PATTERN = re.compile(r"^!wdone\s+(.+)$", re.IGNORECASE)
+WDONE_PATTERN = re.compile(r"^!wdone\s+(.+)$", re.IGNORECASE | re.DOTALL)
 WDONE_PREFIX = re.compile(r"^!wdone\b", re.IGNORECASE)
-WBOUNCE_PATTERN = re.compile(r"^!wbounce\s+(.+)$", re.IGNORECASE)
+WBOUNCE_PATTERN = re.compile(r"^!wbounce\s+(.+)$", re.IGNORECASE | re.DOTALL)
 WBOUNCE_PREFIX = re.compile(r"^!wbounce\b", re.IGNORECASE)
 WHELP_PATTERN = re.compile(r"^!whelp$", re.IGNORECASE)
 WREMINDER_STATUS_PATTERN = re.compile(r"^!wreminder$", re.IGNORECASE)
 WREMINDER_SET_PATTERN = re.compile(r"^!wreminder-set\s+(.+)$", re.IGNORECASE)
 WREMINDER_OFF_PATTERN = re.compile(r"^!wreminder-off$", re.IGNORECASE)
 WREMINDER_REMOVE_PATTERN = re.compile(r"^!wreminder-remove$", re.IGNORECASE)
-WASSIGN_PATTERN = re.compile(r"^!wassign\s+(.+?)\s+((?:@\w+\s*)+)$", re.IGNORECASE)
 WASSIGN_PREFIX = re.compile(r"^!wassign\b", re.IGNORECASE)
 WLEADERBOARD_PATTERN = re.compile(r"^!wleaderboard(?:\s+(last))?$", re.IGNORECASE)
 WLEADERBOARD_OFF_PATTERN = re.compile(r"^!wleaderboard-off$", re.IGNORECASE)
@@ -59,32 +59,53 @@ QUALIFIED_REFERENCE_PATTERN = re.compile(r"[^/\s]+/[0-9]+")
 NUMBER_PATTERN = re.compile(r"[0-9]+")
 LEGACY_REFERENCE_PATTERN = re.compile(r"#[0-9]+")
 MENTION_PATTERN = re.compile(r"@\w+")
+MENTIONS_PATTERN = re.compile(r"(?:@\w+)+")
 # Commas separate links and usernames, but a comma inside a URL's query string stays part of it.
 WADD_SEPARATOR_PATTERN = re.compile(r"\s+|,+(?=\s|$|@|https?://)", re.IGNORECASE)
-# PR/MR number ranges such as 55-100 or 55..100.
-RANGE_PATTERN = re.compile(r"([0-9]+)\s*(?:-|\.{2,}|…)\s*([0-9]+)")
-CLEAR_REFERENCE_PATTERN = re.compile(rf"{RANGE_PATTERN.pattern}|[^\s,]+")
+# PR/MR number ranges such as 55-100, 55..100, or 55...100. Nothing may separate the numbers from the
+# dash, so a bulleted list ("12" then "- 15" on the next line) or a stray "5 -8" is never a range.
+RANGE_PATTERN = re.compile(r"([0-9]+)(?:-|\.{2,}|…)([0-9]+)")
+# Several references or ranges separated by spaces, commas, or new lines. PR/MR paths never contain
+# commas, so a comma after a URL's path starts the next reference (…/pull/5,6), but a comma inside its
+# query string or fragment stays part of it, as with !wadd.
+REFERENCE_LIST_PATTERN = re.compile(
+    rf"{RANGE_PATTERN.pattern}|https?://[^\s,?#]+(?:[?#]\S*?(?=,*(?:\s|$)|,+https?://))?|[^\s,]+",
+    re.IGNORECASE)
 
 MEMBER_STATUSES = (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER)
 # Telegram rate-limits bursts of requests, so check a user's groups a few at a time.
 MEMBERSHIP_CHECK_CONCURRENCY = 5
 
+WMERGED_USAGE = (
+    "Usage: <code>!wmerged &lt;PR/MR references&gt;</code>\n"
+    "Mark your approved PRs/MRs as merged, so they leave <code>!wme</code>.\n"
+    "Examples: <code>!wmerged repo/123</code>, <code>!wmerged 123</code>, <code>!wmerged 55 67 88</code>, "
+    "<code>!wmerged 55-60</code>, or <code>!wmerged https://github.com/owner/repo/pull/123</code>"
+)
+WDONE_USAGE = (
+    "Usage: <code>!wdone &lt;PR/MR references&gt;</code>\n"
+    "Examples: <code>!wdone repo/123</code>, <code>!wdone 123</code>, <code>!wdone 1 2 3 4</code>, "
+    "<code>!wdone 1...4</code>, or <code>!wdone https://github.com/owner/repo/pull/123</code>"
+)
+WBOUNCE_USAGE = (
+    "Usage: <code>!wbounce &lt;PR/MR references&gt;</code>\n"
+    "Remove tasks with a Changes required comment.\n"
+    "Examples: <code>!wbounce repo/123</code>, <code>!wbounce 123</code>, <code>!wbounce 1 2 3</code>, "
+    "<code>!wbounce 1-3</code>, or <code>!wbounce https://github.com/owner/repo/pull/123</code>"
+)
+WASSIGN_USAGE = (
+    "Usage: <code>!wassign &lt;PR/MR references&gt; @username [...]</code>\n"
+    "Examples:\n"
+    "• <code>!wassign repo/123 @alice</code>\n"
+    "• <code>!wassign 123 @alice @bob</code>\n"
+    "• <code>!wassign 55 67 88 @alice</code> or <code>!wassign 55-60 @alice</code>\n"
+    "• <code>!wassign 55 67 @alice</code>, then <code>88 @bob</code> on the next line\n"
+    "• <code>!wassign https://github.com/owner/repo/pull/123 @alice @bob @charlie</code>"
+)
+# Ranges in one command on the shared queue (!wdone, !wbounce, !wassign) can cover at most this many
+# reviews in total, so a typo such as 12-120 for "12 120" can't empty the queue.
+MAX_QUEUE_RANGE = 20
 REFERENCE_USAGE = "Use a PR/MR reference such as <code>repo/120</code>, its URL, or an unambiguous PR/MR number. Use <code>!w</code> to see current references."
-
-
-def parse_assignees(assignees_str: str) -> list[str]:
-    """Parse multiple @mentions from a string into a list of formatted usernames.
-    
-    Args:
-        assignees_str: String containing one or more @username mentions
-        
-    Returns:
-        List of usernames with @ prefix (e.g., ['@alice', '@bob'])
-    """
-    # Find all @username patterns
-    mentions = re.findall(r'@(\w+)', assignees_str)
-    # Return with @ prefix
-    return [f"@{mention}" for mention in mentions]
 
 
 WADD_USAGE = (
@@ -166,20 +187,140 @@ def matching_reviews(reviews: list, task_ref: str) -> list | None:
     return [review for review in reviews if (saved := parse_review_url(review.url)) and saved[1] == parsed[1]]
 
 
-def resolve_task_reference(chat_id: int, task_ref: str) -> tuple[Task | None, str | None]:
-    """Find one task in this chat, or explain why the reference cannot be used."""
-    if LEGACY_REFERENCE_PATTERN.fullmatch(task_ref):
-        return None, f"Queue numbers such as <code>{html_escape(task_ref)}</code> are no longer supported. {REFERENCE_USAGE}"
+def number_key(number: str) -> tuple[int, str]:
+    """Order normalized PR/MR numbers numerically without converting arbitrarily long digit strings."""
+    return len(number), number
 
-    matches = matching_reviews(db.get_tasks(chat_id), task_ref)
-    if matches is None:
-        return None, f"Invalid PR/MR reference <code>{html_escape(task_ref)}</code>. {REFERENCE_USAGE}"
-    if len(matches) == 1:
-        return matches[0], None
-    if len(matches) > 1:
-        alternatives = ", ".join(review_link(task.task_id, task.url) for task in matches)
-        return None, f"PR/MR number <code>{html_escape(task_ref)}</code> matches multiple reviews: {alternatives}. Use a qualified PR/MR reference."
-    return None, f"PR/MR reference <code>{html_escape(task_ref)}</code> not found in this chat. Use <code>!w</code> to see current references."
+
+def reviews_in_range(reviews: list, low: str, high: str) -> list:
+    low, high = sorted((number_key(normalize_review_number(low)), number_key(normalize_review_number(high))))
+    return [review for review in reviews
+            if (number := review_number(review)) is not None and low <= number_key(number) <= high]
+
+
+def review_identity(review) -> tuple:
+    """The PR/MR a review points at. Links saved before URL parsing was tightened may not parse; each
+    such link only stands for itself."""
+    parsed = parse_review_url(review.url)
+    return parsed[1] if parsed else ("", review.url, "")
+
+
+def split_references(args: str) -> list[str]:
+    """Split command arguments into PR/MR references and number ranges."""
+    return [match.group(0) for match in REFERENCE_LIST_PATTERN.finditer(args)]
+
+
+def invalid_reference_error(references: list[str], usage: str) -> str | None:
+    """Explain the first reference that isn't a PR/MR reference or number range, if any."""
+    for reference in references:
+        if LEGACY_REFERENCE_PATTERN.fullmatch(reference):
+            return f"Queue numbers such as <code>{html_escape(reference)}</code> are no longer supported.{usage}"
+        if not RANGE_PATTERN.fullmatch(reference) and matching_reviews([], reference) is None:
+            return f"Invalid PR/MR reference <code>{html_escape(reference)}</code>.{usage}"
+    return None
+
+
+@dataclass
+class Resolution:
+    matched: dict = field(default_factory=dict)  # Matched reviews by key, each once, in order.
+    missing: list[str] = field(default_factory=list)
+    ambiguous: list[tuple[str, list]] = field(default_factory=list)
+    ranges: list[tuple[str, list]] = field(default_factory=list)  # Each range with the reviews it matched.
+
+
+def number_clashes(reviews: list) -> list:
+    """Reviews sharing a PR/MR number with a different PR/MR, such as api/5 and web/5."""
+    by_number = {}
+    for review in reviews:
+        by_number.setdefault(review_number(review), []).append(review)
+    return [review for same_number in by_number.values()
+            if len({review_identity(other) for other in same_number}) > 1 for review in same_number]
+
+
+def resolve_references(reviews: list, references: list[str], key: Callable, shared_queue: bool = False) -> Resolution:
+    """Match references and number ranges against reviews.
+
+    A reference matching several different PRs/MRs is ambiguous; the same PR/MR can appear more than
+    once (e.g. finished in several chats), but repos on different hosts or paths can share a number.
+    A range takes every PR/MR numbered within it. On the shared queue, where a typo would affect
+    everyone, a range is held to the same rule as a single number (see also range_limit_error).
+    """
+    resolution = Resolution()
+    for reference in references:
+        if range_match := RANGE_PATTERN.fullmatch(reference):
+            matches = reviews_in_range(reviews, range_match.group(1), range_match.group(2))
+            resolution.ranges.append((reference, matches))
+            if shared_queue and (clashes := number_clashes(matches)):
+                resolution.ambiguous.append((reference, clashes))
+                continue
+        else:
+            matches = matching_reviews(reviews, reference)
+            if len({review_identity(review) for review in matches}) > 1:
+                resolution.ambiguous.append((reference, matches))
+                continue
+        if not matches:
+            resolution.missing.append(reference)
+        resolution.matched.update((key(review), review) for review in matches)
+    return resolution
+
+
+def references_list(references: list[str]) -> str:
+    return ", ".join(f"<code>{html_escape(reference)}</code>" for reference in references)
+
+
+def links(reviews: list) -> str:
+    return ", ".join(review_link(review.task_id, review.url) for review in reviews)
+
+
+def ambiguity_blocks(ambiguous: list[tuple[str, list]], what: str) -> list[str]:
+    return [f"<code>{html_escape(reference)}</code> includes the same number in several repos: {links(matches)}. "
+            "List them with qualified PR/MR references instead."
+            if RANGE_PATTERN.fullmatch(reference) else
+            f"<code>{html_escape(reference)}</code> matches several {what}: {links(matches)}. Use a qualified PR/MR reference."
+            for reference, matches in ambiguous]
+
+
+def range_limit_error(resolutions: list[Resolution]) -> str | None:
+    """Explain why a queue command's ranges cover too many reviews in total, if they do."""
+    ranges = [item for resolution in resolutions for item in resolution.ranges]
+    covered = len({task.id for _, matches in ranges for task in matches})
+    if covered <= MAX_QUEUE_RANGE:
+        return None
+    subject = (f"<code>{html_escape(ranges[0][0])}</code> covers" if len(ranges) == 1
+               else f"{references_list([reference for reference, _ in ranges])} cover")
+    return (f"{subject} {covered} reviews. Ranges can cover at most {MAX_QUEUE_RANGE} reviews per command, "
+            "so nothing was changed.")
+
+
+def queue_problem_blocks(resolution: Resolution, gone: list[Task]) -> list[str]:
+    """Report references that matched nothing or several reviews, and tasks removed in the meantime."""
+    blocks = []
+    if resolution.missing:
+        noun = "PR/MR reference" if len(resolution.missing) == 1 else "PR/MR references"
+        blocks.append(f"{noun} {references_list(resolution.missing)} not found in this chat. "
+                      "Use <code>!w</code> to see current references.")
+    blocks += ambiguity_blocks(resolution.ambiguous, "reviews")
+    if gone:
+        blocks.append(f"Already removed from the queue: {links(gone)}.")
+    return blocks
+
+
+async def resolve_queue_references(update: Update, chat_id: int, groups: list[list[str]]) -> list[Resolution] | None:
+    """Match each group of references against this chat's queue, or reply with why the command can't run."""
+    if error := invalid_reference_error([reference for group in groups for reference in group], f" {REFERENCE_USAGE}"):
+        await update.message.reply_text(error, parse_mode=ParseMode.HTML)
+        return None
+    tasks = db.get_tasks(chat_id)
+    resolutions = [resolve_references(tasks, group, key=lambda task: task.id, shared_queue=True) for group in groups]
+    if error := range_limit_error(resolutions):
+        await update.message.reply_text(error, parse_mode=ParseMode.HTML)
+        return None
+    return resolutions
+
+
+async def reply_blocks(update: Update, blocks: list[str]) -> None:
+    for text in split_messages(blocks):
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
 def sender_identity(update: Update) -> tuple[int | None, str]:
@@ -224,12 +365,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await handle_wmerged(update, context, chat_id, wmerged_match.group(1).strip())
         return
     elif WMERGED_PREFIX.match(text):
-        await update.message.reply_text(
-            "Usage: <code>!wmerged &lt;PR/MR reference&gt;</code>\n"
-            "Mark one of your approved PRs/MRs as merged, so it leaves <code>!wme</code>.\n"
-            "Examples: <code>!wmerged repo/123</code>, <code>!wmerged 123</code>, or <code>!wmerged https://github.com/owner/repo/pull/123</code>",
-            parse_mode=ParseMode.HTML
-        )
+        await update.message.reply_text(WMERGED_USAGE, parse_mode=ParseMode.HTML)
         return
 
     wclear_match = WCLEAR_PATTERN.match(text)
@@ -243,30 +379,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Check for !wdone command
     wdone_match = WDONE_PATTERN.match(text)
     if wdone_match:
-        task_ref = wdone_match.group(1).strip()
-        await handle_wdone(update, chat_id, task_ref)
+        await handle_wdone(update, chat_id, wdone_match.group(1).strip())
         return
     elif WDONE_PREFIX.match(text):
-        await update.message.reply_text(
-            "Usage: <code>!wdone &lt;PR/MR reference&gt;</code>\n"
-            "Examples: <code>!wdone repo/123</code>, <code>!wdone 123</code>, or <code>!wdone https://github.com/owner/repo/pull/123</code>",
-            parse_mode=ParseMode.HTML
-        )
+        await update.message.reply_text(WDONE_USAGE, parse_mode=ParseMode.HTML)
         return
     
     # Check for !wbounce command
     wbounce_match = WBOUNCE_PATTERN.match(text)
     if wbounce_match:
-        task_ref = wbounce_match.group(1).strip()
-        await handle_wbounce(update, chat_id, task_ref)
+        await handle_wbounce(update, chat_id, wbounce_match.group(1).strip())
         return
     elif WBOUNCE_PREFIX.match(text):
-        await update.message.reply_text(
-            "Usage: <code>!wbounce &lt;PR/MR reference&gt;</code>\n"
-            "Remove a task with a Changes required comment.\n"
-            "Examples: <code>!wbounce repo/123</code>, <code>!wbounce 123</code>, or <code>!wbounce https://github.com/owner/repo/pull/123</code>",
-            parse_mode=ParseMode.HTML
-        )
+        await update.message.reply_text(WBOUNCE_USAGE, parse_mode=ParseMode.HTML)
         return
 
     # Check for !whelp command
@@ -315,27 +440,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     
     # Check for !wassign command
-    wassign_match = WASSIGN_PATTERN.match(text)
-    if wassign_match:
-        task_ref = wassign_match.group(1).strip()
-        assignees_str = wassign_match.group(2)
-        assignees = parse_assignees(assignees_str)
-        await handle_wassign(update, chat_id, task_ref, assignees)
-        return
-    elif WASSIGN_PREFIX.match(text):
+    if WASSIGN_PREFIX.match(text):
+        groups = parse_wassign(text[len("!wassign"):])
+        if groups is not None:
+            await handle_wassign(update, chat_id, groups)
+            return
         parts = text.split()
         if len(parts) > 1 and LEGACY_REFERENCE_PATTERN.fullmatch(parts[1]):
-            _, error = resolve_task_reference(chat_id, parts[1])
-            await update.message.reply_text(error, parse_mode=ParseMode.HTML)
+            await update.message.reply_text(invalid_reference_error(parts[1:2], f" {REFERENCE_USAGE}"), parse_mode=ParseMode.HTML)
             return
-        await update.message.reply_text(
-            "Usage: <code>!wassign &lt;PR/MR reference&gt; @username [...]</code>\n"
-            "Examples:\n"
-            "• <code>!wassign repo/123 @alice</code>\n"
-            "• <code>!wassign 123 @alice @bob</code>\n"
-            "• <code>!wassign https://github.com/owner/repo/pull/123 @alice @bob @charlie</code>",
-            parse_mode=ParseMode.HTML
-        )
+        await update.message.reply_text(WASSIGN_USAGE, parse_mode=ParseMode.HTML)
         return
 
 
@@ -414,42 +528,47 @@ async def handle_wme(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id
                                                       chat_titles=chat_titles, unchecked_chats=unchecked))
 
 
-async def handle_wmerged(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, task_ref: str) -> None:
-    """Handle !wmerged command - take one of the sender's approved PRs/MRs off their !wme list."""
+async def handle_wmerged(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, args: str) -> None:
+    """Handle !wmerged command - take the sender's approved PRs/MRs off their !wme list."""
     user_id, name = sender_identity(update)
     if user_id is None:
         await update.message.reply_text("<code>!wmerged</code> needs to know who you are. Send it from your own account, not anonymously.",
                                         parse_mode=ParseMode.HTML)
+        return
+    references = split_references(args)
+    if not references:
+        await update.message.reply_text(WMERGED_USAGE, parse_mode=ParseMode.HTML)
+        return
+    if error := invalid_reference_error(references, " Use a reference such as <code>repo/120</code>, its URL, or its number."):
+        await update.message.reply_text(error, parse_mode=ParseMode.HTML)
         return
 
     username = update.effective_user.username
     since = datetime.now(timezone.utc) - timedelta(days=FINISHED_VISIBLE_DAYS)
     approved = [review for review in db.get_finished_reviews(user_id, f"@{username}" if username else None, since, chat_id)
                 if review.outcome == "done"]
-    matches = matching_reviews(approved, task_ref)
-    if matches is None:
-        await update.message.reply_text(
-            f"Invalid PR/MR reference <code>{html_escape(task_ref)}</code>. Use a reference such as <code>repo/120</code>, its URL, or its number.",
-            parse_mode=ParseMode.HTML)
-        return
-    if len(matches) > 1:
-        # The alternatives list the sender's approved PRs/MRs, which only they should see.
-        alternatives = ", ".join(review_link(review.task_id, review.url) for review in matches)
-        await reply_privately(update, context, [
-            f"PR/MR number <code>{html_escape(task_ref)}</code> matches several of your approved reviews: {alternatives}. Use a qualified PR/MR reference."
-        ])
-        return
-    if not matches:
-        await update.message.reply_text(
-            f"<code>{html_escape(task_ref)}</code> isn't one of your approved PRs/MRs in this chat. Use <code>!wme</code> to see them.",
-            parse_mode=ParseMode.HTML)
-        return
+    resolution = resolve_references(approved, references, key=lambda review: review.activity_id)
+    merged = list(resolution.matched.values())
+    db.mark_merged([review.activity_id for review in merged], name, user_id)
 
-    review = matches[0]
-    db.mark_merged(review.activity_id, name, user_id)
-    await update.message.reply_text(f"✅ Marked {review_link(review.task_id, review.url)} as merged.",
-                                    parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    logger.info(f"Marked review {review.task_id} as merged in chat {chat_id}")
+    blocks = []
+    if len(merged) == 1:
+        blocks.append(f"✅ Marked {review_link(merged[0].task_id, merged[0].url)} as merged.")
+    elif merged:
+        blocks.append(f"✅ Marked {len(merged)} as merged:")
+        blocks += [f"• {review_link(review.task_id, review.url)}" for review in merged]
+    if resolution.missing:
+        verb = "isn't one of" if len(resolution.missing) == 1 else "aren't among"
+        blocks.append(f"{references_list(resolution.missing)} {verb} your approved PRs/MRs in this chat. "
+                      "Use <code>!wme</code> to see them.")
+    if blocks:
+        await reply_blocks(update, blocks)
+    if resolution.ambiguous:
+        # The alternatives list the sender's approved PRs/MRs, which only they should see.
+        # Once some were marked merged, sending the command again wouldn't repeat this reply.
+        await reply_privately(update, context, split_messages(ambiguity_blocks(resolution.ambiguous, "of your approved reviews")),
+                              public_outcome="Some references match several of your approved reviews." if merged else None)
+    logger.info(f"Marked {len(merged)} reviews as merged in chat {chat_id}")
 
 
 WCLEAR_USAGE = (
@@ -457,17 +576,6 @@ WCLEAR_USAGE = (
     "Clear your approved or bounced PRs/MRs from <code>!wme</code>.\n"
     "Examples: <code>!wclear 55 67 88</code>, <code>!wclear 55-100</code>, <code>!wclear repo/55, repo/67</code>, or <code>!wclear all</code>"
 )
-
-
-def number_key(number: str) -> tuple[int, str]:
-    """Order normalized PR/MR numbers numerically without converting arbitrarily long digit strings."""
-    return len(number), number
-
-
-def reviews_in_range(reviews: list[FinishedReview], low: str, high: str) -> list[FinishedReview]:
-    low, high = sorted((number_key(normalize_review_number(low)), number_key(normalize_review_number(high))))
-    return [review for review in reviews
-            if (number := review_number(review)) is not None and low <= number_key(number) <= high]
 
 
 async def handle_wclear(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, args: str) -> None:
@@ -478,52 +586,36 @@ async def handle_wclear(update: Update, context: ContextTypes.DEFAULT_TYPE, chat
                                         parse_mode=ParseMode.HTML)
         return
 
-    references = [match.group(0) for match in CLEAR_REFERENCE_PATTERN.finditer(args)]
+    references = split_references(args)
     if not references:
         await update.message.reply_text(WCLEAR_USAGE, parse_mode=ParseMode.HTML)
         return
     clear_all = [reference.lower() for reference in references] == ["all"]
-    if not clear_all:
-        for reference in references:
-            if not RANGE_PATTERN.fullmatch(reference) and matching_reviews([], reference) is None:
-                await update.message.reply_text(f"Invalid PR/MR reference <code>{html_escape(reference)}</code>.\n{WCLEAR_USAGE}",
-                                                parse_mode=ParseMode.HTML)
-                return
+    if not clear_all and (error := invalid_reference_error(references, f"\n{WCLEAR_USAGE}")):
+        await update.message.reply_text(error, parse_mode=ParseMode.HTML)
+        return
 
     _, finished, chat_titles, unchecked = await visible_reviews(update, context, chat_id, user_id, with_assigned=False)
-    cleared = {review.activity_id: review for review in finished} if clear_all else {}
-    missing, ambiguous = [], []
-    for reference in [] if clear_all else references:
-        if range_match := RANGE_PATTERN.fullmatch(reference):
-            matches = reviews_in_range(finished, range_match.group(1), range_match.group(2))
-        else:
-            matches = matching_reviews(finished, reference)
-            # The same PR/MR can be finished in several chats when clearing from a direct message,
-            # but repos on different hosts or paths can share a task_id.
-            if len({parse_review_url(review.url)[1] for review in matches}) > 1:
-                ambiguous.append((reference, matches))
-                continue
-        if not matches:
-            missing.append(reference)
-        cleared.update((review.activity_id, review) for review in matches)
+    if clear_all:
+        resolution = Resolution(matched={review.activity_id: review for review in finished})
+    else:
+        resolution = resolve_references(finished, references, key=lambda review: review.activity_id)
+    cleared, missing = resolution.matched, resolution.missing
 
     db.clear_finished_reviews(list(cleared), name, user_id)
     blocks = []
     if cleared:
         blocks.append(f"🧹 <b>Cleared {len(cleared)} from your <code>!wme</code> list</b>")
         blocks += grouped_by_chat(list(cleared.values()), finished_listing, chat_titles)
-    elif clear_all or not (missing or ambiguous):
+    elif clear_all or not (missing or resolution.ambiguous):
         blocks.append("Nothing to clear: you have no approved or bounced PRs/MRs here.")
     if missing:
         blocks.append(
             "Not among your approved or bounced PRs/MRs: "
-            + ", ".join(f"<code>{html_escape(reference)}</code>" for reference in missing)
+            + references_list(missing)
             + ". Finish reviews assigned to you with <code>!wdone</code> or <code>!wbounce</code>."
         )
-    for reference, matches in ambiguous:
-        alternatives = ", ".join(review_link(review.task_id, review.url) for review in matches)
-        blocks.append(f"<code>{html_escape(reference)}</code> matches several of your PRs/MRs: {alternatives}. "
-                      "Use a qualified PR/MR reference.")
+    blocks += ambiguity_blocks(resolution.ambiguous, "of your PRs/MRs")
     if unchecked:
         groups = "1 of your groups" if unchecked == 1 else f"{unchecked} of your groups"
         blocks.append(f"⚠️ I couldn't check {groups} right now, so nothing there was cleared.")
@@ -635,40 +727,51 @@ async def private_reply_failure(context: ContextTypes.DEFAULT_TYPE, chat_id: int
     return "I couldn't reply privately right now."
 
 
-async def handle_wdone(update: Update, chat_id: int, task_ref: str) -> None:
-    """Handle !wdone command - remove a task by PR/MR reference."""
-    await handle_remove_task(update, chat_id, task_ref, outcome="done")
+async def handle_wdone(update: Update, chat_id: int, args: str) -> None:
+    """Handle !wdone command - remove tasks by PR/MR reference, number, or number range."""
+    await handle_remove_tasks(update, chat_id, args, outcome="done", usage=WDONE_USAGE)
 
 
-async def handle_wbounce(update: Update, chat_id: int, task_ref: str) -> None:
-    """Handle !wbounce command - remove a task that requires changes."""
-    await handle_remove_task(update, chat_id, task_ref, outcome="bounce", comment="Changes required.")
+async def handle_wbounce(update: Update, chat_id: int, args: str) -> None:
+    """Handle !wbounce command - remove tasks that require changes."""
+    await handle_remove_tasks(update, chat_id, args, outcome="bounce", usage=WBOUNCE_USAGE, comment="Changes required.")
 
 
-async def handle_remove_task(update: Update, chat_id: int, task_ref: str, outcome: str,
+async def handle_remove_tasks(update: Update, chat_id: int, args: str, outcome: str, usage: str,
                               comment: Optional[str] = None) -> None:
-    """Remove a task and reply with an optional comment."""
-    task, error = resolve_task_reference(chat_id, task_ref)
-    if error:
-        await update.message.reply_text(error, parse_mode=ParseMode.HTML)
+    """Remove the referenced tasks in one transaction and report what was removed and what wasn't."""
+    references = split_references(args)
+    if not references:
+        await update.message.reply_text(usage, parse_mode=ParseMode.HTML)
+        return
+    resolutions = await resolve_queue_references(update, chat_id, [references])
+    if resolutions is None:
         return
 
+    resolution = resolutions[0]
+    tasks = list(resolution.matched.values())
     completed_by_id, completed_by = sender_identity(update)
     try:
-        removed_task = db.complete_task(chat_id, task.id, outcome, completed_by, completed_by_id)
+        removed = db.complete_tasks(chat_id, [task.id for task in tasks], outcome, completed_by, completed_by_id)
     except Exception:
-        logger.exception("Could not complete review %s in chat %s", task.task_id, chat_id)
-        await update.message.reply_text("Could not remove the review. Please try again later.")
+        logger.exception("Could not complete reviews %s in chat %s", [task.task_id for task in tasks], chat_id)
+        await update.message.reply_text(
+            "Could not remove the review. Please try again later." if len(tasks) == 1
+            else "Could not remove the reviews, so none were removed. Please try again later.")
         return
-    if removed_task is None:
-        await update.message.reply_text(f"PR/MR reference <code>{html_escape(task_ref)}</code> not found in this chat.", parse_mode=ParseMode.HTML)
-        return
-    
-    response = f'Removed {review_link(removed_task.task_id, removed_task.url)} (added by {html_escape(removed_task.created_by)})'
-    if comment:
-        response += f"\n{html_escape(comment)}"
-    await update.message.reply_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    logger.info(f"Removed task {removed_task.task_id} from chat {chat_id}")
+
+    removed_ids = {task.id for task in removed}
+    blocks = []
+    if len(removed) == 1:
+        blocks.append(f"Removed {review_link(removed[0].task_id, removed[0].url)} (added by {html_escape(removed[0].created_by)})")
+    elif removed:
+        blocks.append(f"Removed {len(removed)}:")
+        blocks += [f"• {review_link(task.task_id, task.url)} (added by {html_escape(task.created_by)})" for task in removed]
+    if removed and comment:
+        blocks.append(html_escape(comment))
+    blocks += queue_problem_blocks(resolution, [task for task in tasks if task.id not in removed_ids])
+    await reply_blocks(update, blocks)
+    logger.info(f"Removed {len(removed)} tasks ({outcome}) from chat {chat_id}")
 
 
 async def handle_wleaderboard(update: Update, chat_id: int, previous: bool = False) -> None:
@@ -687,7 +790,7 @@ async def handle_wleaderboard_toggle(update: Update, chat_id: int, enabled: bool
 
 async def handle_whelp(update: Update) -> None:
     """Handle !whelp command - display help instructions."""
-    help_text = """<b>Work Queue Commands</b>
+    help_text = f"""<b>Work Queue Commands</b>
 
 <code>!wadd &lt;URL&gt; [@username ...]</code>
 Add one or more merge requests (optionally assign to one or more users)
@@ -703,24 +806,26 @@ List all tasks in the queue
 <code>!wme</code>
 Privately show reviews assigned to you, and your PRs/MRs that were approved (ready to merge) or bounced (only you see the reply; the bot must be a group admin)
 
-<code>!wmerged &lt;PR/MR reference&gt;</code>
-Mark one of your approved PRs/MRs as merged, so it leaves <code>!wme</code>
+<code>!wmerged &lt;PR/MR references&gt;</code>
+Mark your approved PRs/MRs as merged, so they leave <code>!wme</code>
+Examples: <code>!wmerged 123</code>, <code>!wmerged 55 67</code>, or <code>!wmerged 55-60</code>
 
 <code>!wclear &lt;PR/MR references&gt;</code> / <code>!wclear all</code>
 Clear your approved or bounced PRs/MRs from <code>!wme</code> (only you see the reply; the bot must be a group admin)
 Examples: <code>!wclear 55 67 88</code>, <code>!wclear 55-100</code>, or <code>!wclear all</code>
 
-<code>!wdone &lt;PR/MR reference&gt;</code>
-Remove a completed task by PR/MR reference, URL, or unambiguous PR/MR number
-Examples: <code>!wdone repo/123</code>, <code>!wdone 123</code>, or <code>!wdone https://github.com/owner/repo/pull/123</code>
+<code>!wdone &lt;PR/MR references&gt;</code>
+Remove completed tasks by PR/MR reference, URL, unambiguous PR/MR number, or number range
+Examples: <code>!wdone repo/123</code>, <code>!wdone 123</code>, <code>!wdone 1 2 3 4</code>, or <code>!wdone 1...4</code>
 
-<code>!wbounce &lt;PR/MR reference&gt;</code>
-Remove a task with a Changes required comment
-Examples: <code>!wbounce repo/123</code>, <code>!wbounce 123</code>, or <code>!wbounce https://github.com/owner/repo/pull/123</code>
+<code>!wbounce &lt;PR/MR references&gt;</code>
+Remove tasks with a Changes required comment
+Examples: <code>!wbounce repo/123</code>, <code>!wbounce 123</code>, <code>!wbounce 1 2 3</code>, or <code>!wbounce 1-3</code>
 
-<code>!wassign &lt;PR/MR reference&gt; @username [...]</code>
-Assign or reassign task (replaces all existing assignees)
-Examples: <code>!wassign repo/45 @alice</code>, <code>!wassign 45 @bob @charlie</code>, or <code>!wassign https://github.com/owner/repo/pull/45 @alice @bob</code>
+<code>!wassign &lt;PR/MR references&gt; @username [...]</code>
+Assign or reassign tasks (replaces all existing assignees)
+Examples: <code>!wassign repo/45 @alice</code>, <code>!wassign 45 @bob @charlie</code>, or <code>!wassign 45 46 50-52 @alice</code>
+One line per group gives each its own users. Ranges in one queue command cover at most {MAX_QUEUE_RANGE} reviews.
 
 <code>!wreminder-set &lt;cron_expression&gt;</code>
 Set automatic reminder (5-part cron format, UTC time)
@@ -904,29 +1009,56 @@ async def handle_wreminder_remove(update: Update, chat_id: int) -> None:
     logger.info(f"Removed reminder for chat {chat_id}")
 
 
-async def handle_wassign(update: Update, chat_id: int, task_ref: str, assignees: list[str]) -> None:
-    """Handle !wassign command - assign or reassign a task to one or more users."""
-    task, error = resolve_task_reference(chat_id, task_ref)
-    if error:
-        await update.message.reply_text(error, parse_mode=ParseMode.HTML)
+def parse_wassign(args: str) -> list[tuple[list[str], list[str]]] | None:
+    """Split !wassign arguments into (references, assignees) groups, or None if they don't fit.
+
+    Each run of references goes to the @usernames that follow it, so
+    `!wassign 5 6 @alice` followed by a line `7 @bob` gives 5 and 6 to @alice and 7 to @bob.
+    """
+    groups = []
+    for token in split_references(args):
+        if token.startswith("@"):
+            if not groups or not MENTIONS_PATTERN.fullmatch(token):
+                return None
+            groups[-1][1].extend(mention for mention in MENTION_PATTERN.findall(token) if mention not in groups[-1][1])
+        elif not groups or groups[-1][1]:
+            groups.append(([token], []))
+        else:
+            groups[-1][0].append(token)
+    return groups if groups and groups[-1][1] else None
+
+
+async def handle_wassign(update: Update, chat_id: int, groups: list[tuple[list[str], list[str]]]) -> None:
+    """Handle !wassign command - assign or reassign tasks to one or more users, in one transaction."""
+    resolutions = await resolve_queue_references(update, chat_id, [references for references, _ in groups])
+    if resolutions is None:
         return
 
-    updated_task = db.update_task_assignees_by_id(chat_id, task.task_id, assignees)
-    if updated_task is None:
-        await update.message.reply_text(f"PR/MR reference <code>{html_escape(task_ref)}</code> not found in this chat.", parse_mode=ParseMode.HTML)
+    # A task named in several groups goes to the last one.
+    owner = {task_id: index for index, resolution in enumerate(resolutions) for task_id in resolution.matched}
+    try:
+        updated = {task.id: task for task in db.assign_tasks(chat_id, [(task_id, groups[index][1])
+                                                                      for task_id, index in owner.items()])}
+    except Exception:
+        logger.exception("Could not assign reviews in chat %s", chat_id)
+        await update.message.reply_text("Could not assign the reviews, so nothing was changed. Please try again later.")
         return
-    
-    response = review_link(updated_task.task_id, updated_task.url)
-    if assignees:
-        assignees_formatted = ", ".join(html_escape(a) for a in assignees)
-        response += f" → {assignees_formatted}"
-    else:
-        response += " (unassigned)"
-    
-    await update.message.reply_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    
-    assignees_log = ", ".join(assignees) if assignees else "unassigned"
-    logger.info(f"Assigned task {updated_task.task_id} to {assignees_log} in chat {chat_id}")
+
+    blocks, gone = [], {}
+    for index, resolution in enumerate(resolutions):
+        tasks = [updated[task_id] for task_id in resolution.matched if task_id in updated and owner[task_id] == index]
+        gone.update((task_id, task) for task_id, task in resolution.matched.items() if task_id not in updated)
+        names = ", ".join(html_escape(assignee) for assignee in groups[index][1])
+        if len(tasks) == 1:
+            blocks.append(f"{review_link(tasks[0].task_id, tasks[0].url)} → {names}")
+        elif tasks:
+            blocks.append(f"Assigned {len(tasks)} → {names}:")
+            blocks += [f"• {review_link(task.task_id, task.url)}" for task in tasks]
+    combined = Resolution(missing=[reference for resolution in resolutions for reference in resolution.missing],
+                          ambiguous=[item for resolution in resolutions for item in resolution.ambiguous])
+    blocks += queue_problem_blocks(combined, list(gone.values()))
+    await reply_blocks(update, blocks)
+    logger.info(f"Assigned {len(updated)} tasks in chat {chat_id}")
 
 
 async def post_init(application: Application) -> None:

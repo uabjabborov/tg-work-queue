@@ -116,7 +116,7 @@ class QueueReferenceTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(command=command):
                 suffix = " @alice" if command == "wassign" else ""
                 reply = await self.send_command(f"!{command} 120{suffix}")
-                self.assertIn("matches multiple reviews", reply.args[0])
+                self.assertIn("<code>120</code> matches several reviews", reply.args[0])
                 self.assertIn('>monorepo/120</a>', reply.args[0])
                 self.assertIn('>backend/120</a>', reply.args[0])
                 self.assertEqual(reply.kwargs["parse_mode"], "HTML")
@@ -281,6 +281,212 @@ class QueueReferenceTests(unittest.IsolatedAsyncioTestCase):
         legacy_reply = await self.send_command("!wassign #1")
         self.assertIn("Queue numbers", legacy_reply.args[0])
         self.assertIn("!w", legacy_reply.args[0])
+
+    async def test_wdone_and_wbounce_remove_lists_and_ranges(self):
+        for command in ("wdone", "wbounce"):
+            for text in (f"!{command} 1 2 3 4", f"!{command} 1...4", f"!{command} 1..4", f"!{command} 1-4",
+                         f"!{command} 1, 2,3\n4", f"!{command.upper()} 4-1"):
+                with self.subTest(text=text):
+                    for number in (1, 2, 3, 4, 5):
+                        self.add_task(task_id=f"repo/{number}")
+                    reply = await self.send_command(text)
+                    message = reply.args[0]
+                    self.assertTrue(message.startswith("Removed 4:\n• "))
+                    for number in (1, 2, 3, 4):
+                        self.assertIn(f">repo/{number}</a> (added by @author)", message)
+                    self.assertEqual(message.endswith("\nChanges required."), command == "wbounce")
+                    self.assertEqual(reply.kwargs["parse_mode"], "HTML")
+                    self.assertTrue(reply.kwargs["disable_web_page_preview"])
+                    self.assertEqual([task.task_id for task in self.db.get_tasks(1)], ["repo/5"])
+                    self.db.complete_task(1, self.db.get_tasks(1)[0].id, "done", "@author")
+
+    async def test_wdone_list_reports_missing_and_ambiguous_references_and_removes_the_rest(self):
+        self.add_task(task_id="repo/1")
+        self.add_task(task_id="repo/2", url="https://github.com/owner/repo/pull/2?a=1,2")
+        self.add_task(task_id="api/7")
+        self.add_task(task_id="web/7")
+
+        reply = await self.send_command("!wdone repo/1, https://github.com/owner/repo/pull/2?a=1,2 7 99 50-60 1")
+
+        message = reply.args[0]
+        self.assertTrue(message.startswith("Removed 2:"))
+        self.assertIn(">repo/1</a>", message)
+        self.assertIn(">repo/2</a>", message)
+        self.assertIn("PR/MR references <code>99</code>, <code>50-60</code> not found in this chat.", message)
+        self.assertIn("<code>7</code> matches several reviews:", message)
+        self.assertIn(">api/7</a>", message)
+        self.assertEqual([task.task_id for task in self.db.get_tasks(1)], ["api/7", "web/7"])
+
+        reply = await self.send_command("!wbounce api/7, web/7")
+        self.assertTrue(reply.args[0].startswith("Removed 2:"))
+        self.assertEqual(self.db.get_tasks(1), [])
+
+    async def test_wdone_list_with_an_invalid_reference_changes_nothing(self):
+        self.add_task(task_id="repo/1")
+        self.add_task(task_id="repo/2")
+        before = self.db.get_tasks(1)
+        for text, expected in (("!wdone 1 #2", "Queue numbers such as <code>#2</code>"),
+                               ("!wbounce 1 bad<ref>", "Invalid PR/MR reference <code>bad&lt;ref&gt;</code>"),
+                               ("!wassign 1 x/y @alice", "Invalid PR/MR reference <code>x/y</code>"),
+                               ("!wdone , ,", "Usage: <code>!wdone"),
+                               ("!wassign , @alice", "Usage: <code>!wassign")):
+            with self.subTest(text=text):
+                reply = await self.send_command(text)
+                self.assertIn(expected, reply.args[0])
+                self.assertEqual(self.db.get_tasks(1), before)
+
+    async def test_wassign_assigns_lists_and_ranges(self):
+        for number in (1, 2, 3, 4, 5):
+            self.add_task(task_id=f"repo/{number}")
+
+        reply = await self.send_command("!wassign 1, 3-4\n99 @alice @bob")
+
+        message = reply.args[0]
+        self.assertTrue(message.startswith("Assigned 3 → @alice, @bob:\n• "))
+        self.assertIn("PR/MR reference <code>99</code> not found in this chat", message)
+        assignees = {task.task_id: task.assignees for task in self.db.get_tasks(1)}
+        self.assertEqual(assignees, {"repo/1": ["@alice", "@bob"], "repo/2": ["@reviewer"], "repo/3": ["@alice", "@bob"],
+                                     "repo/4": ["@alice", "@bob"], "repo/5": ["@reviewer"]})
+
+    async def test_list_commands_skip_old_links_that_no_longer_parse(self):
+        self.add_task(task_id="repo/5", url="https://github.com/owner/repo/pull/5/files")
+        self.add_task(task_id="repo/6")
+
+        reply = await self.send_command("!wdone 5 6")
+
+        self.assertTrue(reply.args[0].startswith("Removed 2:"))
+        self.assertEqual(self.db.get_tasks(1), [])
+
+    async def test_ranges_on_the_queue_reject_shared_numbers_and_large_spans(self):
+        self.add_task(task_id="api/7")
+        self.add_task(task_id="web/7")
+        self.add_task(task_id="repo/8")
+        before = self.db.get_tasks(1)
+
+        reply = await self.send_command("!wdone 7-7 8")
+        self.assertIn("<code>7-7</code> includes the same number in several repos:", reply.args[0])
+        self.assertIn(">api/7</a>", reply.args[0])
+        self.assertTrue(reply.args[0].startswith("Removed "))
+        self.assertEqual([task.task_id for task in self.db.get_tasks(1)], ["api/7", "web/7"])
+
+        for number in range(100, 100 + bot.MAX_QUEUE_RANGE + 1):
+            self.add_task(task_id=f"repo/{number}")
+        before = self.db.get_tasks(1)
+        for text in ("!wdone 7 100-1000", "!wbounce 100-200", "!wassign 100-200 @alice"):
+            with self.subTest(text=text):
+                reply = await self.send_command(text)
+                self.assertIn(f"covers {bot.MAX_QUEUE_RANGE + 1} reviews.", reply.args[0])
+                self.assertIn("nothing was changed", reply.args[0])
+                self.assertEqual(self.db.get_tasks(1), before)
+
+        # Ranges within the limit still work.
+        reply = await self.send_command(f"!wdone 100-{99 + bot.MAX_QUEUE_RANGE}")
+        self.assertTrue(reply.args[0].startswith(f"Removed {bot.MAX_QUEUE_RANGE}:"))
+
+    async def test_ranges_need_adjacent_numbers_and_are_capped_per_command(self):
+        for number in range(1, 2 * bot.MAX_QUEUE_RANGE + 1):
+            self.add_task(task_id=f"repo/{number}")
+        before = self.db.get_tasks(1)
+
+        # A bulleted list or a stray dash is never read as a range.
+        for text, invalid in (("!wdone 12\n- 15", "-"), ("!wdone 5 -8", "-8"), ("!wbounce 5 - 8", "-")):
+            with self.subTest(text=text):
+                reply = await self.send_command(text)
+                self.assertIn(f"Invalid PR/MR reference <code>{invalid}</code>", reply.args[0])
+                self.assertEqual(self.db.get_tasks(1), before)
+
+        # The limit counts every range in the command, including across !wassign lines.
+        half = bot.MAX_QUEUE_RANGE // 2
+        for text in (f"!wdone 1-{half} {half + 1}-{bot.MAX_QUEUE_RANGE + 1}",
+                     f"!wassign 1-{half} @alice\n{half + 1}-{bot.MAX_QUEUE_RANGE + 1} @bob"):
+            with self.subTest(text=text):
+                reply = await self.send_command(text)
+                self.assertIn(f"<code>1-{half}</code>, <code>{half + 1}-{bot.MAX_QUEUE_RANGE + 1}</code> cover "
+                              f"{bot.MAX_QUEUE_RANGE + 1} reviews.", reply.args[0])
+                self.assertIn("nothing was changed", reply.args[0])
+                self.assertEqual(self.db.get_tasks(1), before)
+
+        # Overlapping ranges count each review once, and plain references don't count.
+        reply = await self.send_command(f"!wdone 1-{bot.MAX_QUEUE_RANGE} 2-3 {bot.MAX_QUEUE_RANGE + 1}")
+        self.assertTrue(reply.args[0].startswith(f"Removed {bot.MAX_QUEUE_RANGE + 1}:"))
+
+    def test_range_limit_in_help_and_readme_matches_the_code(self):
+        readme = (Path(__file__).parent / "README.md").read_text()
+        self.assertIn(f"covering more than {bot.MAX_QUEUE_RANGE} reviews", readme)
+
+    async def test_wdone_list_failure_removes_nothing(self):
+        self.add_task(task_id="repo/1")
+        self.add_task(task_id="repo/2")
+        before = self.db.get_tasks(1)
+        with self.db._get_connection() as conn:
+            conn.execute("""
+                CREATE TRIGGER fail_second_delete BEFORE DELETE ON tasks WHEN old.task_id = 'repo/2'
+                BEGIN SELECT RAISE(ABORT, 'delete failure'); END
+            """)
+
+        with self.assertLogs("bot", level="ERROR"):
+            reply = await self.send_command("!wdone 1 2")
+
+        self.assertEqual(reply.args[0], "Could not remove the reviews, so none were removed. Please try again later.")
+        self.assertEqual(self.db.get_tasks(1), before)
+
+    async def test_wassign_list_failure_changes_nothing(self):
+        self.add_task(task_id="repo/1")
+        self.add_task(task_id="repo/2")
+        before = self.db.get_tasks(1)
+        with self.db._get_connection() as conn:
+            conn.execute("""
+                CREATE TRIGGER fail_second_assign BEFORE UPDATE ON tasks WHEN old.task_id = 'repo/2'
+                BEGIN SELECT RAISE(ABORT, 'update failure'); END
+            """)
+
+        with self.assertLogs("bot", level="ERROR"):
+            reply = await self.send_command("!wassign 1 2 @alice")
+
+        self.assertIn("so nothing was changed", reply.args[0])
+        self.assertEqual(self.db.get_tasks(1), before)
+
+    async def test_list_commands_report_reviews_removed_in_the_meantime(self):
+        self.add_task(task_id="repo/1")
+        self.add_task(task_id="repo/2")
+        stale = self.db.get_tasks(1)
+        self.db.complete_task(1, stale[1].id, "done", "@someone")
+
+        for text, expected in (("!wassign 1 2 @alice", '<a href="https://github.com/owner/repo/pull/1">repo/1</a> → @alice'),
+                               ("!wdone 1 2", "Removed <a")):
+            with self.subTest(text=text), patch.object(self.db, "get_tasks", return_value=stale):
+                reply = await self.send_command(text)
+                self.assertIn(expected, reply.args[0])
+                self.assertIn('Already removed from the queue: <a href="https://github.com/owner/repo/pull/2">repo/2</a>.',
+                              reply.args[0])
+        self.assertEqual(self.db.get_tasks(1), [])
+
+    async def test_comma_after_a_url_starts_the_next_reference(self):
+        self.add_task(task_id="repo/5")
+        self.add_task(task_id="repo/6")
+
+        reply = await self.send_command("!wdone https://github.com/owner/repo/pull/5,6")
+
+        self.assertTrue(reply.args[0].startswith("Removed 2:"))
+        self.assertEqual(self.db.get_tasks(1), [])
+
+    async def test_wassign_gives_each_line_its_own_assignees(self):
+        for number in (5, 6, 7):
+            self.add_task(task_id=f"repo/{number}")
+
+        reply = await self.send_command("!wassign 5 6 @alice @alice\n7 @bob,@carol@bob")
+
+        self.assertIn("Assigned 2 → @alice:", reply.args[0])
+        self.assertNotIn("@alice, @alice", reply.args[0])
+        self.assertIn(">repo/7</a> → @bob, @carol", reply.args[0])
+        assignees = {task.task_id: task.assignees for task in self.db.get_tasks(1)}
+        self.assertEqual(assignees, {"repo/5": ["@alice"], "repo/6": ["@alice"], "repo/7": ["@bob", "@carol"]})
+
+        for text in ("!wassign 5 @alice\n6", "!wassign @alice 5", "!wassign 5 @al-ice"):
+            with self.subTest(text=text):
+                reply = await self.send_command(text)
+                self.assertIn("Usage: <code>!wassign", reply.args[0])
+        self.assertEqual({task.task_id: task.assignees for task in self.db.get_tasks(1)}, assignees)
 
     def test_url_parsing_rejects_non_review_paths_and_malformed_hosts(self):
         self.assertEqual(
@@ -685,7 +891,8 @@ class WmeCommandTests(unittest.IsolatedAsyncioTestCase):
 
         cases = (
             ("!wmerged", "Usage: <code>!wmerged"),
-            ("!wmerged #5", "Invalid PR/MR reference"),
+            ("!wmerged #5", "Queue numbers such as <code>#5</code>"),
+            ("!wmerged x/y", "Invalid PR/MR reference"),
             ("!wmerged 6", "isn't one of your approved"),
         )
         for text, expected in cases:
@@ -708,6 +915,53 @@ class WmeCommandTests(unittest.IsolatedAsyncioTestCase):
         reply = await self.wme_reply()
         self.assertIn("ready to merge (1)", reply)
         self.assertIn(">web/5</a>", reply)
+
+    async def test_wmerged_marks_lists_and_ranges(self):
+        for repo in ("api", "web"):
+            await self.finish((5,), repo=repo)
+        await self.finish((6, 7, 8, 20))
+        await self.finish((9,), outcome="wbounce")
+
+        update, telegram_bot = await self.command("!wmerged 6...8, 9 99 5")
+
+        message = update.message.reply_text.await_args.args[0]
+        self.assertTrue(message.startswith("✅ Marked 3 as merged:\n• "))
+        for number in (6, 7, 8):
+            self.assertIn(f">repo/{number}</a>", message)
+        # A bounced review isn't approved, so it can't be marked merged.
+        self.assertIn("<code>9</code>, <code>99</code> aren't among your approved PRs/MRs in this chat.", message)
+        self.assertNotIn("api/5", message)
+        # The ambiguity lists the sender's approved PRs/MRs, so only they see it.
+        reply = private_reply(telegram_bot)
+        self.assertIn("<code>5</code> matches several of your approved reviews", reply)
+        self.assertIn(">web/5</a>", reply)
+        wme = await self.wme_reply()
+        self.assertIn("ready to merge (3)", wme)
+        for task_id in ("api/5", "web/5", "repo/20"):
+            self.assertIn(f">{task_id}</a>", wme)
+
+        update, _ = await self.command("!wmerged 1 #2")
+        self.assertIn("Queue numbers such as <code>#2</code>", update.message.reply_text.await_args.args[0])
+
+    async def test_wmerged_does_not_suggest_resending_after_marking_some_merged(self):
+        for repo in ("api", "web"):
+            await self.finish((5,), repo=repo)
+        await self.finish((6,))
+        failing_bot = self.make_bot(AsyncMock(side_effect=TimedOut()))
+
+        update = self.make_update("!wmerged 6 5")
+        await self.send(update, failing_bot)
+
+        replies = [call.args[0] for call in update.message.reply_text.await_args_list]
+        self.assertIn(">repo/6</a> as merged.", replies[0])
+        self.assertIn("Some references match several of your approved reviews.", replies[1])
+        self.assertIn("you may not have gotten the details", replies[1])
+        self.assertNotIn("send the command again", replies[1])
+
+        # With nothing marked, sending the command again repeats the same reply, so it's suggested.
+        update = self.make_update("!wmerged 5")
+        await self.send(update, failing_bot)
+        self.assertIn("send the command again", update.message.reply_text.await_args.args[0])
 
     async def test_marking_merged_does_not_change_the_leaderboard(self):
         await self.command("!wadd https://github.com/owner/repo/pull/5 @bob")
@@ -795,7 +1049,8 @@ class WmeCommandTests(unittest.IsolatedAsyncioTestCase):
         cases = (
             ("!wclear", "Usage: <code>!wclear"),
             ("!wclear , ,", "Usage: <code>!wclear"),
-            ("!wclear 5 #6", "Invalid PR/MR reference <code>#6</code>"),
+            ("!wclear 5 #6", "Queue numbers such as <code>#6</code> are no longer supported.\nUsage: <code>!wclear"),
+            ("!wclear 5 x/y", "Invalid PR/MR reference <code>x/y</code>.\nUsage: <code>!wclear"),
         )
         # These errors don't list the sender's PRs/MRs, so they stay public.
         for text, expected in cases:
